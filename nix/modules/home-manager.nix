@@ -12,8 +12,8 @@ in
 {
   meta.maintainers = with lib.maintainers; [ Kirottu ];
 
-  options.programs.anyrun = {
-    enable = mkEnableOption "anyrun";
+  options.programs.yand = {
+    enable = mkEnableOption "yand";
     package = mkOption {
       type = nullOr package;
       default = self.packages.${pkgs.system}.yand;

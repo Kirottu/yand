@@ -106,8 +106,6 @@ impl Component for App {
             tx: init.tx,
         };
 
-        relm4::set_global_css_from_file("res/style.css").unwrap();
-
         let monitors = WidgetExt::display(&root).monitors();
 
         let monitor = if let Some(output) = &model.config.output {

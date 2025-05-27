@@ -24,7 +24,9 @@ rustPlatform.buildRustPackage {
 
   strictDeps = true;
 
-  cargoLock = ../../Cargo.lock;
+  cargoLock = {
+    lockFile = ../../Cargo.lock;
+  };
 
   nativeBuildInputs = [
     pkg-config
