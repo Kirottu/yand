@@ -1,4 +1,4 @@
-use std::{rc::Rc, thread};
+use std::{fs, rc::Rc, thread};
 
 use dbus::{DbusInput, DbusOutput};
 use gtk::{gdk, prelude::*};
@@ -6,20 +6,33 @@ use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use notification::{Notification, NotificationOutput};
 use relm4::prelude::*;
+use serde::Deserialize;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 mod dbus;
 mod notification;
 
+#[derive(Deserialize)]
 pub struct Config {
     width: i32,
     spacing: i32,
-    output: String,
+    output: Option<String>,
     timeout: u32,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            width: 400,
+            spacing: 10,
+            output: None,
+            timeout: 10,
+        }
+    }
+}
+
 struct App {
-    config: Rc<Config>,
+    config: Rc<Config>, // TODO: Runtime reloadable
     notifications: FactoryVecDeque<Notification>,
     tx: UnboundedSender<dbus::DbusInput>,
 }
@@ -29,23 +42,12 @@ struct AppInit {
     tx: UnboundedSender<dbus::DbusInput>,
 }
 
-/// Messages that are transmitted inside the Relm4 App
-#[derive(Debug)]
-enum AppInput {
-    Notification(NotificationOutput),
-}
-
-#[derive(Debug)]
-enum AppCmdOutput {
-    Dbus(DbusOutput),
-}
-
 #[relm4::component]
 impl Component for App {
     type Init = AppInit;
-    type Input = AppInput;
+    type Input = NotificationOutput;
     type Output = ();
-    type CommandOutput = AppCmdOutput;
+    type CommandOutput = DbusOutput;
 
     view! {
         gtk::Window {
@@ -75,17 +77,31 @@ impl Component for App {
     ) -> ComponentParts<Self> {
         let notifications = FactoryVecDeque::builder()
             .launch(gtk::Box::default())
-            .forward(sender.input_sender(), |output| {
-                AppInput::Notification(output)
-            });
+            .forward(sender.input_sender(), |output| output);
+
+        let dirs = xdg::BaseDirectories::with_prefix("yand");
+
+        let config_path = dirs
+            .place_config_file("config.ron")
+            .expect("Failed to create config directory");
+        let style_path = dirs
+            .get_config_file("style.css")
+            .expect("Failed to get style path");
+
+        let config = if let Ok(str) = fs::read_to_string(config_path) {
+            ron::from_str::<Config>(&str).expect("Failed to parse config")
+        } else {
+            Default::default()
+        };
+
+        if let Ok(str) = fs::read_to_string(style_path) {
+            relm4::set_global_css(&str);
+        } else {
+            relm4::set_global_css(include_str!("../res/style.css"));
+        }
 
         let model = Self {
-            config: Rc::new(Config {
-                spacing: 10,
-                width: 400,
-                output: "DP-3".to_string(),
-                timeout: 0,
-            }),
+            config: Rc::new(config),
             notifications,
             tx: init.tx,
         };
@@ -94,15 +110,19 @@ impl Component for App {
 
         let monitors = WidgetExt::display(&root).monitors();
 
-        let monitor = monitors.into_iter().find_map(|item| {
-            let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
+        let monitor = if let Some(output) = &model.config.output {
+            monitors.into_iter().find_map(|item| {
+                let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
 
-            if monitor.connector() == Some(model.config.output.clone().into()) {
-                Some(monitor)
-            } else {
-                None
-            }
-        });
+                if monitor.connector() == Some(output.clone().into()) {
+                    Some(monitor)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
 
         let notification_box = model.notifications.widget();
         let widgets = view_output!();
@@ -111,7 +131,7 @@ impl Component for App {
 
         sender.command(async move |sender, _shutdown_receiver| {
             while let Some(msg) = rx.recv().await {
-                sender.send(AppCmdOutput::Dbus(msg)).unwrap();
+                sender.send(msg).unwrap();
             }
         });
 
@@ -126,7 +146,7 @@ impl Component for App {
         root: &Self::Root,
     ) {
         match message {
-            AppInput::Notification(NotificationOutput::Close { index, reason }) => {
+            NotificationOutput::Close { index, reason } => {
                 if let Some(notification) = self.notifications.guard().remove(index.current_index())
                 {
                     self.tx
@@ -137,7 +157,7 @@ impl Component for App {
                         .unwrap()
                 }
             }
-            AppInput::Notification(NotificationOutput::ActionInvoked { index, action }) => {
+            NotificationOutput::ActionInvoked { index, action } => {
                 if let Some(notification) = self.notifications.guard().remove(index.current_index())
                 {
                     self.tx
@@ -161,42 +181,45 @@ impl Component for App {
         root: &Self::Root,
     ) {
         match message {
-            AppCmdOutput::Dbus(dbus_output) => match dbus_output {
-                DbusOutput::Notification(dbus_notification) => {
-                    // It is fine to run the replacement routine here as if replace_id is 0 no notification
-                    // will match it anyways
-                    let mut notifications = self.notifications.guard();
+            DbusOutput::Notification(dbus_notification) => {
+                // It is fine to run the replacement routine here as if replace_id is 0 no notification
+                // will match it anyways
+                let mut notifications = self.notifications.guard();
 
-                    let index = notifications
+                let index = notifications
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, notification)| {
+                        if notification.id == dbus_notification.replaces_id {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(index) = index {
+                    notifications.remove(index);
+                    notifications.insert(index, (dbus_notification, self.config.clone()));
+                } else {
+                    notifications.push_back((dbus_notification, self.config.clone()));
+                }
+            }
+            DbusOutput::CloseNotification(id) => {
+                let i =
+                    self.notifications
+                        .guard()
                         .iter()
                         .enumerate()
-                        .find_map(|(i, notification)| {
-                            if notification.id == dbus_notification.replaces_id {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(index) = index {
-                        notifications.remove(index);
-                        notifications.insert(index, (dbus_notification, self.config.clone()));
-                    } else {
-                        notifications.push_back((dbus_notification, self.config.clone()));
-                    }
-                }
-                DbusOutput::CloseNotification(id) => {
-                    let i = self.notifications.guard().iter().enumerate().find_map(
-                        |(i, notification)| if notification.id == id { Some(i) } else { None },
-                    );
+                        .find_map(
+                            |(i, notification)| if notification.id == id { Some(i) } else { None },
+                        );
 
-                    if let Some(i) = i {
-                        self.notifications.guard().remove(i);
-                    }
+                if let Some(i) = i {
+                    self.notifications.guard().remove(i);
                 }
-                DbusOutput::Quit => {
-                    root.destroy();
-                }
-            },
+            }
+            DbusOutput::Quit => {
+                root.destroy();
+            }
         }
 
         self.update_window(root);

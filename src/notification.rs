@@ -155,6 +155,7 @@ impl FactoryComponent for Notification {
                     NotificationIcon::None => gtk::Box { }
                 },
 
+                // TODO: Configurable height limit
                 gtk::Box {
                     set_hexpand: true,
                     set_orientation: gtk::Orientation::Vertical,
