@@ -1,0 +1,36 @@
+window {
+  background: transparent;
+}
+
+.notification {
+  background: @theme_bg_color;
+  margin: 10px;
+  box-shadow: 0 0 5px black;
+  border-radius: 10px;
+}
+
+.summary {
+  margin: 5px;
+}
+
+.body {
+  margin: 5px;
+}
+
+.action {
+  border-radius: 0px;
+  border-right: 1px solid @borders;
+}
+
+.action:first-child {
+  border-radius: 0 0 0 10px;
+}
+
+.action:last-child {
+  border-radius: 0 0 10px;
+  border-right: none;
+}
+
+.icon {
+  margin: 5px;
+}
