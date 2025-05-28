@@ -49,6 +49,13 @@ rustPlatform.buildRustPackage {
   CARGO_BUILD_INCREMENTAL = "false";
   RUST_BACKTRACE = "full";
 
+  postInstall = ''
+    mkdir -p $out/lib/systemd/user
+    substitute $src/systemd/yand.service $out/lib/systemd/user/yand.service \
+      --replace-fail '/usr/bin' "$out/bin"
+    chmod 0644 $out/lib/systemd/user/yand.service
+  '';
+
   meta = {
     description = "Yet Another Notification Daemon";
     homepage = "https://github.com/Kirottu/yand";

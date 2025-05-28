@@ -82,14 +82,14 @@ impl Component for App {
         let dirs = xdg::BaseDirectories::with_prefix("yand");
 
         let config_path = dirs
-            .place_config_file("config.ron")
+            .place_config_file("config.toml")
             .expect("Failed to create config directory");
         let style_path = dirs
             .get_config_file("style.css")
             .expect("Failed to get style path");
 
         let config = if let Ok(str) = fs::read_to_string(config_path) {
-            ron::from_str::<Config>(&str).expect("Failed to parse config")
+            toml::from_str::<Config>(&str).expect("Failed to parse config")
         } else {
             Default::default()
         };

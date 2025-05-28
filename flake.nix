@@ -31,6 +31,19 @@
             yand = pkgs.callPackage ./nix/packages/yand.nix { inherit inputs; };
             default = self'.packages.yand;
           };
+          devShells = {
+            default = pkgs.mkShell {
+              inputsFrom = builtins.attrValues self'.packages;
+              packages = with pkgs; [
+                rustc
+                gcc
+                pkg-config
+                cargo
+                clippy
+                rustfmt
+              ];
+            };
+          };
         };
       flake = {
         homeModules = {
