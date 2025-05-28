@@ -2,6 +2,9 @@ use clap::{Parser, Subcommand};
 use dbus::ControlProxy;
 use zbus::Connection;
 
+// We only need `ControlProxy` from the dbus mod, so a lot of dead code warnings are generated
+// for the `yandctl` build otherwise
+#[allow(dead_code)]
 mod dbus;
 
 #[derive(Parser)]

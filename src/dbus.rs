@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fmt::Display,
     sync::atomic::{self, AtomicU32},
 };
@@ -54,7 +54,7 @@ pub struct DbusNotification {
     pub app_icon: String,
     pub summary: String,
     pub body: String,
-    pub actions: BTreeMap<String, String>,
+    pub actions: Vec<(String, String)>,
     pub expire_timeout: i32,
 
     // Supported hints

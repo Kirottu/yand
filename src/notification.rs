@@ -77,6 +77,8 @@ pub struct Notification {
     body: String,
     urgency: Urgency,
 
+    config: Config,
+
     actions_factory: FactoryVecDeque<ActionButton>,
     default_action: Option<String>,
 }
@@ -163,11 +165,13 @@ impl FactoryComponent for Notification {
                     set_css_classes: &["body"],
                     set_halign: gtk::Align::Start,
                     set_valign: gtk::Align::Center,
-                    set_hexpand: true,
+                    set_xalign: 0.0,
                     set_wrap: true,
                     set_use_markup: true,
                     set_natural_wrap_mode: gtk::NaturalWrapMode::Word,
                     set_wrap_mode: pango::WrapMode::WordChar,
+                    set_lines: self.config.max_lines,
+                    set_ellipsize: pango::EllipsizeMode::End,
                 }
             },
 
@@ -205,7 +209,13 @@ impl FactoryComponent for Notification {
             dbus_notification.expire_timeout as u32
         };
 
-        let default_action = dbus_notification.actions.remove(DEFAULT_ACTION);
+        let default_action_index = dbus_notification
+            .actions
+            .iter()
+            .enumerate()
+            .find_map(|(i, (key, _))| if key == DEFAULT_ACTION { Some(i) } else { None });
+
+        let default_action = default_action_index.map(|i| dbus_notification.actions.remove(i).1);
 
         let mut actions_factory: FactoryVecDeque<ActionButton> = FactoryVecDeque::builder()
             .launch(gtk::Box::default())
@@ -271,6 +281,7 @@ impl FactoryComponent for Notification {
         };
 
         Self {
+            config,
             icon,
             default_action,
             actions_factory,

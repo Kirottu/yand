@@ -1,13 +1,7 @@
-use std::{
-    cell::{Cell, RefCell},
-    fs,
-    path::PathBuf,
-    rc::Rc,
-    thread,
-};
+use std::{fs, path::PathBuf, thread};
 
 use dbus::{DbusInput, DbusOutput};
-use gtk::{gdk, prelude::*};
+use gtk::{gdk, glib, prelude::*};
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use log::error;
@@ -19,12 +13,35 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 mod dbus;
 mod notification;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
+enum ConfigLayer {
+    Background,
+    Bottom,
+    Top,
+    Overlay,
+}
+
+impl From<ConfigLayer> for Layer {
+    fn from(value: ConfigLayer) -> Self {
+        match value {
+            ConfigLayer::Background => Self::Background,
+            ConfigLayer::Bottom => Self::Bottom,
+            ConfigLayer::Top => Self::Top,
+            ConfigLayer::Overlay => Self::Overlay,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Debug)]
+#[serde(default)]
 pub struct Config {
     width: i32,
     spacing: i32,
     output: Option<String>,
     timeout: u32,
+    layer: ConfigLayer,
+    /// Maximum amount of text lines in notification body
+    max_lines: i32,
 }
 
 impl Default for Config {
@@ -34,6 +51,8 @@ impl Default for Config {
             spacing: 10,
             output: None,
             timeout: 10,
+            layer: ConfigLayer::Overlay,
+            max_lines: 5,
         }
     }
 }
@@ -42,7 +61,9 @@ struct App {
     config_path: PathBuf,
     style_path: PathBuf,
     config: Config,
+    /// Stored reference to global gdk::Display
     display: gdk::Display,
+    /// Used for managing custom CSS
     css_provider: gtk::CssProvider,
     notifications: FactoryVecDeque<Notification>,
     tx: UnboundedSender<dbus::DbusInput>,
@@ -63,10 +84,30 @@ impl Component for App {
     view! {
         gtk::Window {
             init_layer_shell: (),
-            set_layer: Layer::Overlay, // TODO: Configurable
+            #[watch]
+            set_layer: model.config.layer.clone().into(),
             set_anchor: (Edge::Right, true),
             set_anchor: (Edge::Top, true),
             set_namespace: Some("yand"),
+            #[watch]
+            set_monitor: {
+                let monitors = model.display.monitors();
+
+                if let Some(output) = &model.config.output {
+                    monitors.into_iter().find_map(|item| {
+                        let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
+
+                        if monitor.connector() == Some(output.clone().into()) {
+                            Some(monitor)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            }.as_ref(),
+            #[watch]
             set_default_size: (model.config.width, 1),
 
             #[local_ref]
@@ -112,9 +153,18 @@ impl Component for App {
         let notification_box = model.notifications.widget();
         let widgets = view_output!();
 
-        model.reload(&root);
+        model.reload();
 
         let mut rx = init.rx;
+
+        // For some reason using a gtk::Grid inside the Notification causes a ton of GTK warnings
+        // in the log output. The UI works perfectly fine so this is used to suppress the warnings
+        glib::log_set_writer_func(|level, fields| {
+            if level == glib::LogLevel::Error || level == glib::LogLevel::Critical {
+                glib::log_writer_default(level, fields);
+            }
+            glib::LogWriterOutput::Handled
+        });
 
         sender.command(async move |sender, _shutdown_receiver| {
             while let Some(msg) = rx.recv().await {
@@ -127,9 +177,9 @@ impl Component for App {
 
     fn update_with_view(
         &mut self,
-        _widgets: &mut Self::Widgets,
+        widgets: &mut Self::Widgets,
         message: Self::Input,
-        _sender: ComponentSender<Self>,
+        sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
         match message {
@@ -158,13 +208,14 @@ impl Component for App {
         }
 
         self.update_window(root);
+        self.update_view(widgets, sender);
     }
 
     fn update_cmd_with_view(
         &mut self,
-        _widgets: &mut Self::Widgets,
+        widgets: &mut Self::Widgets,
         message: Self::CommandOutput,
-        _sender: ComponentSender<Self>,
+        sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
         match message {
@@ -205,7 +256,7 @@ impl Component for App {
                 }
             }
             DbusOutput::Reload => {
-                self.reload(root);
+                self.reload();
             }
             DbusOutput::Quit => {
                 root.destroy();
@@ -213,6 +264,7 @@ impl Component for App {
         }
 
         self.update_window(root);
+        self.update_view(widgets, sender);
     }
 }
 
@@ -225,7 +277,7 @@ impl App {
         }
     }
 
-    fn reload(&mut self, root: &<App as Component>::Root) {
+    fn reload(&mut self) {
         self.config = if let Ok(str) = fs::read_to_string(&self.config_path) {
             toml::from_str::<Config>(&str).unwrap_or_else(|why| {
                 error!("Failed to parse config file: {}", why);
@@ -234,24 +286,6 @@ impl App {
         } else {
             Config::default()
         };
-        let monitors = self.display.monitors();
-
-        let monitor = if let Some(output) = &self.config.output {
-            monitors.into_iter().find_map(|item| {
-                let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
-
-                if monitor.connector() == Some(output.clone().into()) {
-                    Some(monitor)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-
-        root.set_default_size(self.config.width, 1);
-        root.set_monitor(monitor.as_ref());
 
         gtk::style_context_remove_provider_for_display(&self.display, &self.css_provider);
 
