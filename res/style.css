@@ -19,16 +19,16 @@ window {
 }
 
 .action {
-  border-radius: 0px;
+  border-radius: 0;
   border-right: 1px solid @borders;
 }
 
 .action:first-child {
-  border-radius: 0 0 0 10px;
+  border-bottom-left-radius: 10px;
 }
 
 .action:last-child {
-  border-radius: 0 0 10px;
+  border-bottom-right-radius: 10px;
   border-right: none;
 }
 

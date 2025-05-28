@@ -1,8 +1,4 @@
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    time::Duration,
-};
+use std::time::Duration;
 
 use gtk::{gdk, glib, pango, prelude::*};
 use gtk4 as gtk;
@@ -138,12 +134,12 @@ impl FactoryComponent for Notification {
             },
 
 
-            gtk::Box {
+            gtk::Grid {
                 set_orientation: gtk4::Orientation::Horizontal,
                 set_vexpand: true,
                 set_hexpand: true,
 
-                match &self.icon {
+                attach[0, 0, 1, 1] = match &self.icon {
                     NotificationIcon::Name(name) => #[template] IconWidget {
                         #[watch]
                         set_icon_name: Some(name),
@@ -160,20 +156,18 @@ impl FactoryComponent for Notification {
                 },
 
                 // TODO: Configurable height limit
-                gtk::Box {
+                // set_hexpand: true,
+                // set_orientation: gtk::Orientation::Vertical,
+                attach[1, 0, 1, 1] = &gtk::Label {
+                    set_label: &self.body,
+                    set_css_classes: &["body"],
+                    set_halign: gtk::Align::Start,
+                    set_valign: gtk::Align::Center,
                     set_hexpand: true,
-                    set_orientation: gtk::Orientation::Vertical,
-                    gtk::Label {
-                        set_label: &self.body,
-                        set_css_classes: &["body"],
-                        set_halign: gtk::Align::Start,
-                        set_valign: gtk::Align::Center,
-                        set_hexpand: true,
-                        set_wrap: true,
-                        set_use_markup: true,
-                        set_natural_wrap_mode: gtk::NaturalWrapMode::Word,
-                        set_wrap_mode: pango::WrapMode::WordChar,
-                    }
+                    set_wrap: true,
+                    set_use_markup: true,
+                    set_natural_wrap_mode: gtk::NaturalWrapMode::Word,
+                    set_wrap_mode: pango::WrapMode::WordChar,
                 }
             },
 
