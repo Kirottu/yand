@@ -100,6 +100,7 @@ pub enum DbusInput {
 pub enum DbusOutput {
     Notification(DbusNotification),
     CloseNotification(u32),
+    Reload,
     Quit,
 }
 
@@ -107,8 +108,6 @@ struct Notifications {
     tx: UnboundedSender<DbusOutput>,
     notification_id: AtomicU32,
 }
-
-const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Notifications {
@@ -230,6 +229,23 @@ impl Notifications {
     ) -> Result<(), zbus::Error>;
 }
 
+pub struct Control {
+    tx: UnboundedSender<DbusOutput>,
+}
+
+#[zbus::interface(
+    name = "com.kirottu.Yand",
+    proxy(
+        default_service = "org.freedesktop.Notifications",
+        default_path = "/com/kirottu/Yand"
+    )
+)]
+impl Control {
+    async fn reload(&self) {
+        self.tx.send(DbusOutput::Reload).unwrap();
+    }
+}
+
 pub fn start(rx: UnboundedReceiver<DbusInput>, tx: UnboundedSender<DbusOutput>) {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -251,18 +267,19 @@ async fn dbus_loop(
         let connection = Builder::session()?
             .name("org.freedesktop.Notifications")?
             .serve_at(
-                NOTIFICATIONS_OBJECT_PATH,
+                "/org/freedesktop/Notifications",
                 Notifications {
-                    tx,
+                    tx: tx.clone(),
                     notification_id: AtomicU32::new(1),
                 },
             )?
+            .serve_at("/com/kirottu/Yand", Control { tx })?
             .build()
             .await?;
 
         let object_server = connection
             .object_server()
-            .interface::<&str, Notifications>(NOTIFICATIONS_OBJECT_PATH)
+            .interface::<&str, Notifications>("/org/freedesktop/Notifications")
             .await?;
 
         while let Some(msg) = rx.recv().await {

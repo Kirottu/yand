@@ -1,9 +1,16 @@
-use std::{fs, rc::Rc, thread};
+use std::{
+    cell::{Cell, RefCell},
+    fs,
+    path::PathBuf,
+    rc::Rc,
+    thread,
+};
 
 use dbus::{DbusInput, DbusOutput};
 use gtk::{gdk, prelude::*};
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
+use log::error;
 use notification::{Notification, NotificationOutput};
 use relm4::prelude::*;
 use serde::Deserialize;
@@ -12,7 +19,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 mod dbus;
 mod notification;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     width: i32,
     spacing: i32,
@@ -32,7 +39,11 @@ impl Default for Config {
 }
 
 struct App {
-    config: Rc<Config>, // TODO: Runtime reloadable
+    config_path: PathBuf,
+    style_path: PathBuf,
+    config: Config,
+    display: gdk::Display,
+    css_provider: gtk::CssProvider,
     notifications: FactoryVecDeque<Notification>,
     tx: UnboundedSender<dbus::DbusInput>,
 }
@@ -55,7 +66,6 @@ impl Component for App {
             set_layer: Layer::Overlay, // TODO: Configurable
             set_anchor: (Edge::Right, true),
             set_anchor: (Edge::Top, true),
-            set_monitor: monitor.as_ref(),
             set_namespace: Some("yand"),
             set_default_size: (model.config.width, 1),
 
@@ -63,6 +73,7 @@ impl Component for App {
             notification_box -> gtk::Box {
                 set_css_classes: &["notification-box"],
                 set_orientation: gtk::Orientation::Vertical,
+                #[watch]
                 set_spacing: model.config.spacing,
                 set_hexpand: true,
             }
@@ -88,42 +99,20 @@ impl Component for App {
             .get_config_file("style.css")
             .expect("Failed to get style path");
 
-        let config = if let Ok(str) = fs::read_to_string(config_path) {
-            toml::from_str::<Config>(&str).expect("Failed to parse config")
-        } else {
-            Default::default()
-        };
-
-        if let Ok(str) = fs::read_to_string(style_path) {
-            relm4::set_global_css(&str);
-        } else {
-            relm4::set_global_css(include_str!("../res/style.css"));
-        }
-
-        let model = Self {
-            config: Rc::new(config),
+        let mut model = Self {
+            display: gdk::Display::default().unwrap(),
+            css_provider: gtk::CssProvider::default(),
+            style_path,
+            config_path,
+            config: Config::default(),
             notifications,
             tx: init.tx,
         };
 
-        let monitors = WidgetExt::display(&root).monitors();
-
-        let monitor = if let Some(output) = &model.config.output {
-            monitors.into_iter().find_map(|item| {
-                let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
-
-                if monitor.connector() == Some(output.clone().into()) {
-                    Some(monitor)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-
         let notification_box = model.notifications.widget();
         let widgets = view_output!();
+
+        model.reload(&root);
 
         let mut rx = init.rx;
 
@@ -215,6 +204,9 @@ impl Component for App {
                     self.notifications.guard().remove(i);
                 }
             }
+            DbusOutput::Reload => {
+                self.reload(root);
+            }
             DbusOutput::Quit => {
                 root.destroy();
             }
@@ -231,6 +223,51 @@ impl App {
         } else if self.notifications.is_empty() && root.is_visible() {
             root.set_visible(false);
         }
+    }
+
+    fn reload(&mut self, root: &<App as Component>::Root) {
+        self.config = if let Ok(str) = fs::read_to_string(&self.config_path) {
+            toml::from_str::<Config>(&str).unwrap_or_else(|why| {
+                error!("Failed to parse config file: {}", why);
+                Config::default()
+            })
+        } else {
+            Config::default()
+        };
+        let monitors = self.display.monitors();
+
+        let monitor = if let Some(output) = &self.config.output {
+            monitors.into_iter().find_map(|item| {
+                let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
+
+                if monitor.connector() == Some(output.clone().into()) {
+                    Some(monitor)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        root.set_default_size(self.config.width, 1);
+        root.set_monitor(monitor.as_ref());
+
+        gtk::style_context_remove_provider_for_display(&self.display, &self.css_provider);
+
+        self.css_provider = gtk::CssProvider::new();
+
+        if let Ok(str) = fs::read_to_string(&self.style_path) {
+            self.css_provider.load_from_string(&str);
+        } else {
+            self.css_provider
+                .load_from_string(include_str!("../res/style.css"));
+        }
+        gtk::style_context_add_provider_for_display(
+            &self.display,
+            &self.css_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
 }
 

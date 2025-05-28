@@ -1,4 +1,8 @@
-use std::{rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
 use gtk::{gdk, glib, pango, prelude::*};
 use gtk4 as gtk;
@@ -93,7 +97,7 @@ impl WidgetTemplate for IconWidget {
 
 #[relm4::factory(pub)]
 impl FactoryComponent for Notification {
-    type Init = (DbusNotification, Rc<Config>);
+    type Init = (DbusNotification, Config);
     type Input = ();
     type Output = NotificationOutput;
     type CommandOutput = NotificationOutput;
