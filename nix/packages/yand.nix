@@ -1,4 +1,5 @@
 {
+  wrapGAppsHook4,
   inputs,
   lib,
   glib,
@@ -29,6 +30,7 @@ rustPlatform.buildRustPackage {
   };
 
   nativeBuildInputs = [
+    wrapGAppsHook4
     pkg-config
     rustc
     cargo

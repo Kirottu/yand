@@ -4,12 +4,13 @@ PartOf=graphical-session.target
 After=graphical-session.target
 BindsTo=graphical-session.target
 Requisite=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=dbus
 BusName=org.freedesktop.Notifications
 ExecStart=/usr/bin/yand
-ConditionEnvironment=WAYLAND_DISPLAY
+Restart=on-failure
 
 [Install]
 WantedBy=graphical-session.target

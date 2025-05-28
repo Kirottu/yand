@@ -1,5 +1,5 @@
 {
-  description = "Description for the project";
+  description = "Yet Another Notification Daemon";
 
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -37,6 +37,7 @@
               packages = with pkgs; [
                 rustc
                 gcc
+                gdb
                 pkg-config
                 cargo
                 clippy
