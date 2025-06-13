@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, thread};
 
 use dbus::{DbusInput, DbusOutput};
-use gtk::{gdk, glib, prelude::*};
+use gtk::{gdk, prelude::*};
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use log::error;
@@ -12,6 +12,13 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 mod dbus;
 mod notification;
+
+#[derive(Clone, Deserialize, Debug)]
+struct AppOverride {
+    app_name: String,
+    timeout: Option<u32>,
+    max_lines: Option<i32>,
+}
 
 #[derive(Clone, Deserialize, Debug)]
 enum ConfigLayer {
@@ -42,6 +49,10 @@ pub struct Config {
     layer: ConfigLayer,
     /// Maximum amount of text lines in notification body
     max_lines: i32,
+    icon_size: i32,
+    // Looks nicer in TOML
+    #[serde(rename = "app_override")]
+    app_overrides: Vec<AppOverride>,
 }
 
 impl Default for Config {
@@ -53,7 +64,24 @@ impl Default for Config {
             timeout: 10,
             layer: ConfigLayer::Overlay,
             max_lines: 5,
+            icon_size: 64,
+            app_overrides: vec![],
         }
+    }
+}
+
+impl Config {
+    /// Return the same config entry with overridden options
+    fn overridden(mut self, app_override: AppOverride) -> (Self, bool) {
+        if let Some(val) = app_override.max_lines {
+            self.max_lines = val;
+        }
+        let mut timeout_overridden = false;
+        if let Some(val) = app_override.timeout {
+            self.timeout = val;
+            timeout_overridden = true;
+        }
+        (self, timeout_overridden)
     }
 }
 
@@ -159,12 +187,12 @@ impl Component for App {
 
         // For some reason using a gtk::Grid inside the Notification causes a ton of GTK warnings
         // in the log output. The UI works perfectly fine so this is used to suppress the warnings
-        glib::log_set_writer_func(|level, fields| {
-            if level == glib::LogLevel::Error || level == glib::LogLevel::Critical {
-                glib::log_writer_default(level, fields);
-            }
-            glib::LogWriterOutput::Handled
-        });
+        // glib::log_set_writer_func(|level, fields| {
+        //     if level == glib::LogLevel::Error || level == glib::LogLevel::Critical {
+        //         glib::log_writer_default(level, fields);
+        //     }
+        //     glib::LogWriterOutput::Handled
+        // });
 
         sender.command(async move |sender, _shutdown_receiver| {
             while let Some(msg) = rx.recv().await {

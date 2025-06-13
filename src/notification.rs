@@ -83,16 +83,6 @@ pub struct Notification {
     default_action: Option<String>,
 }
 
-#[relm4::widget_template(pub)]
-impl WidgetTemplate for IconWidget {
-    view! {
-        gtk::Image {
-            set_pixel_size: 64, // TODO: Attempt to make this configurable somehow
-            set_css_classes: &["icon"],
-        }
-    }
-}
-
 #[relm4::factory(pub)]
 impl FactoryComponent for Notification {
     type Init = (DbusNotification, Config);
@@ -102,6 +92,7 @@ impl FactoryComponent for Notification {
     type ParentWidget = gtk::Box;
 
     view! {
+        #[name = "notification"]
         gtk::Box {
             set_css_classes: &["notification", &self.urgency.to_string(), &self.app_name],
             set_orientation: gtk::Orientation::Vertical,
@@ -132,6 +123,8 @@ impl FactoryComponent for Notification {
                 set_css_classes: &["summary"],
                 set_justify: gtk::Justification::Left,
                 set_halign: gtk::Align::Start,
+                set_wrap: false,
+                set_ellipsize: pango::EllipsizeMode::End,
                 set_use_markup: true,
             },
 
@@ -141,25 +134,15 @@ impl FactoryComponent for Notification {
                 set_vexpand: true,
                 set_hexpand: true,
 
-                attach[0, 0, 1, 1] = match &self.icon {
-                    NotificationIcon::Name(name) => #[template] IconWidget {
-                        #[watch]
-                        set_icon_name: Some(name),
+                // For some reason the Image becomes larger if it is not inside a Stack
+                attach[0, 0, 1, 1] = &gtk::Stack {
+                    #[name = "icon"]
+                    gtk::Image {
+                        set_pixel_size: self.config.icon_size,
+                        set_css_classes: &["icon"],
                     },
-                    NotificationIcon::Path(path) => #[template] IconWidget {
-                        #[watch]
-                        set_from_file: Some(path),
-                    },
-                    NotificationIcon::Data(data) => #[template] IconWidget {
-                        #[watch]
-                        set_paintable: Some(data),
-                    },
-                    NotificationIcon::None => gtk::Box { }
                 },
 
-                // TODO: Configurable height limit
-                // set_hexpand: true,
-                // set_orientation: gtk::Orientation::Vertical,
                 attach[1, 0, 1, 1] = &gtk::Label {
                     set_label: &self.body,
                     set_css_classes: &["body"],
@@ -172,6 +155,7 @@ impl FactoryComponent for Notification {
                     set_wrap_mode: pango::WrapMode::WordChar,
                     set_lines: self.config.max_lines,
                     set_ellipsize: pango::EllipsizeMode::End,
+                    set_visible: !self.body.is_empty(),
                 }
             },
 
@@ -195,15 +179,31 @@ impl FactoryComponent for Notification {
 
         let widgets = view_output!();
 
+        match &self.icon {
+            NotificationIcon::Path(path) => widgets.icon.set_from_file(Some(path)),
+            NotificationIcon::Name(name) => widgets.icon.set_icon_name(Some(name)),
+            NotificationIcon::Data(texture) => widgets.icon.set_paintable(Some(texture)),
+            NotificationIcon::None => widgets.icon.set_visible(false),
+        }
+
         widgets
     }
 
     fn init_model(
-        (mut dbus_notification, config): Self::Init,
+        (mut dbus_notification, mut config): Self::Init,
         index: &Self::Index,
         sender: FactorySender<Self>,
     ) -> Self {
-        let mut timeout = if dbus_notification.expire_timeout == -1 {
+        let mut timeout_overridden = false;
+        if let Some(app_override) = config
+            .app_overrides
+            .iter()
+            .find(|app_override| app_override.app_name == dbus_notification.app_name)
+        {
+            (config, timeout_overridden) = config.clone().overridden(app_override.clone());
+        }
+
+        let mut timeout = if dbus_notification.expire_timeout == -1 || timeout_overridden {
             config.timeout
         } else {
             dbus_notification.expire_timeout as u32
@@ -288,7 +288,9 @@ impl FactoryComponent for Notification {
             id: dbus_notification.id,
             app_name: dbus_notification.app_name,
             summary: dbus_notification.summary,
-            body: dbus_notification.body,
+            // Remove all newlines to make sure GTK can properly truncate the label
+            // TODO: Configurable, figure out a better way to do this
+            body: dbus_notification.body.replace('\n', ""),
             urgency: dbus_notification.urgency.unwrap_or_default(),
         }
     }
