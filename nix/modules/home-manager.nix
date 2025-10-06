@@ -78,7 +78,7 @@ in
         Type = "dbus";
         BusName = "org.freedesktop.Notifications";
         ExecStart = "${getExe cfg.package}";
-        Restart = "on-failure";
+        Restart = "always";
       };
       Install.WantedBy = [ config.wayland.systemd.target ];
     };
