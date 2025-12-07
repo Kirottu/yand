@@ -290,7 +290,7 @@ impl FactoryComponent for Notification {
             summary: dbus_notification.summary,
             // Remove all newlines to make sure GTK can properly truncate the label
             // TODO: Configurable, figure out a better way to do this
-            body: dbus_notification.body.replace('\n', ""),
+            body: dbus_notification.body.replace('\n', " "),
             urgency: dbus_notification.urgency.unwrap_or_default(),
         }
     }
