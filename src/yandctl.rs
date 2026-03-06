@@ -15,7 +15,13 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Reload config and style files
     Reload,
+    /// Manage notification level
+    Level {
+        /// Set the notification level to this value
+        level: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -28,5 +34,9 @@ async fn main() {
         Commands::Reload => {
             proxy.reload().await.unwrap();
         }
+        Commands::Level { level } => match level {
+            Some(level) => proxy.set_notification_level(level).await.unwrap(),
+            None => println!("{}", proxy.notification_level().await.unwrap()),
+        },
     }
 }

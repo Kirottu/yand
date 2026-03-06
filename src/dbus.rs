@@ -5,8 +5,38 @@ use std::{
 };
 
 use log::{error, info};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use zbus::{connection::Builder, object_server::SignalEmitter};
+
+#[derive(Debug, Clone, Copy)]
+pub enum NotificationLevel {
+    Normal,
+    Dnd,
+}
+
+impl TryInto<NotificationLevel> for String {
+    type Error = zbus::fdo::Error;
+
+    fn try_into(self) -> Result<NotificationLevel, Self::Error> {
+        match self.as_str() {
+            "normal" => Ok(NotificationLevel::Normal),
+            "dnd" => Ok(NotificationLevel::Dnd),
+            _ => Err(zbus::fdo::Error::Failed(
+                "Invalid notification level".to_string(),
+            )),
+        }
+    }
+}
+
+impl From<NotificationLevel> for String {
+    fn from(val: NotificationLevel) -> Self {
+        match val {
+            NotificationLevel::Normal => "normal",
+            NotificationLevel::Dnd => "dnd",
+        }
+        .to_string()
+    }
+}
 
 #[derive(Debug)]
 pub struct ImageData {
@@ -100,6 +130,8 @@ pub enum DbusInput {
 pub enum DbusOutput {
     Notification(DbusNotification),
     CloseNotification(u32),
+    SetNotificationLevel(NotificationLevel),
+    GetNotificationLevel(UnboundedSender<NotificationLevel>),
     Reload,
     Quit,
 }
@@ -244,6 +276,22 @@ impl Control {
     async fn reload(&self) {
         self.tx.send(DbusOutput::Reload).unwrap();
     }
+
+    #[zbus(property)]
+    async fn notification_level(&self) -> String {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        self.tx.send(DbusOutput::GetNotificationLevel(tx)).unwrap();
+        rx.recv().await.unwrap().into()
+    }
+
+    #[zbus(property)]
+    async fn set_notification_level(&mut self, level: String) -> Result<(), zbus::fdo::Error> {
+        self.tx
+            .send(DbusOutput::SetNotificationLevel(level.try_into()?))
+            .unwrap();
+        Ok(())
+    }
 }
 
 pub fn start(rx: UnboundedReceiver<DbusInput>, tx: UnboundedSender<DbusOutput>) {
@@ -277,7 +325,7 @@ async fn dbus_loop(
             .build()
             .await?;
 
-        let object_server = connection
+        let notifications = connection
             .object_server()
             .interface::<&str, Notifications>("/org/freedesktop/Notifications")
             .await?;
@@ -286,10 +334,10 @@ async fn dbus_loop(
             match msg {
                 DbusInput::NotificationClosed { id, reason } => {
                     info!("Notification {} closed: {:?}", id, reason);
-                    object_server.notification_closed(id, reason.into()).await?
+                    notifications.notification_closed(id, reason.into()).await?
                 }
                 DbusInput::ActionInvoked { id, action } => {
-                    object_server.action_invoked(id, action).await?
+                    notifications.action_invoked(id, action).await?
                 }
             }
         }

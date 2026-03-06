@@ -94,6 +94,7 @@ struct App {
     /// Used for managing custom CSS
     css_provider: gtk::CssProvider,
     notifications: FactoryVecDeque<Notification>,
+    notification_level: dbus::NotificationLevel,
     tx: UnboundedSender<dbus::DbusInput>,
 }
 
@@ -174,6 +175,7 @@ impl Component for App {
             style_path,
             config_path,
             config: Config::default(),
+            notification_level: dbus::NotificationLevel::Normal,
             notifications,
             tx: init.tx,
         };
@@ -247,28 +249,12 @@ impl Component for App {
         root: &Self::Root,
     ) {
         match message {
-            DbusOutput::Notification(dbus_notification) => {
-                // It is fine to run the replacement routine here as if replace_id is 0 no notification
-                // will match it anyways
-                let mut notifications = self.notifications.guard();
-
-                let index = notifications
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, notification)| {
-                        if notification.id == dbus_notification.replaces_id {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    });
-                if let Some(index) = index {
-                    notifications.remove(index);
-                    notifications.insert(index, (dbus_notification, self.config.clone()));
-                } else {
-                    notifications.push_back((dbus_notification, self.config.clone()));
+            DbusOutput::Notification(dbus_notification) => match self.notification_level {
+                dbus::NotificationLevel::Normal => {
+                    self.add_notification_popup(dbus_notification);
                 }
-            }
+                dbus::NotificationLevel::Dnd => {}
+            },
             DbusOutput::CloseNotification(id) => {
                 let i =
                     self.notifications
@@ -282,6 +268,12 @@ impl Component for App {
                 if let Some(i) = i {
                     self.notifications.guard().remove(i);
                 }
+            }
+            DbusOutput::GetNotificationLevel(tx) => {
+                tx.send(self.notification_level).unwrap();
+            }
+            DbusOutput::SetNotificationLevel(level) => {
+                self.notification_level = level;
             }
             DbusOutput::Reload => {
                 self.reload();
@@ -330,6 +322,29 @@ impl App {
             &self.css_provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+
+    fn add_notification_popup(&mut self, dbus_notification: dbus::DbusNotification) {
+        // It is fine to run the replacement routine here as if replace_id is 0 no notification
+        // will match it anyways
+        let mut notifications = self.notifications.guard();
+
+        let index = notifications
+            .iter()
+            .enumerate()
+            .find_map(|(i, notification)| {
+                if notification.id == dbus_notification.replaces_id {
+                    Some(i)
+                } else {
+                    None
+                }
+            });
+        if let Some(index) = index {
+            notifications.remove(index);
+            notifications.insert(index, (dbus_notification, self.config.clone()));
+        } else {
+            notifications.push_back((dbus_notification, self.config.clone()));
+        }
     }
 }
 

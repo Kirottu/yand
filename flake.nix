@@ -38,6 +38,8 @@
                 rustc
                 gcc
                 gdb
+                gtk4
+                gtk4-layer-shell
                 pkg-config
                 cargo
                 clippy
