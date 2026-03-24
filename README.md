@@ -45,8 +45,8 @@ are explained in the following config snippet:
 # (most likely currently focused output) will be used
 output = "DP-3"
 # Layer shell layer that the notifications are placed on. Available values:
-# background, bottom, top, overlay
-layer = "overlay"
+# Background, Bottom, Top, Overlay
+layer = "Overlay"
 # Spacing between notifications
 spacing = 10
 # The default timeout. Can be overridden by applications or the config
