@@ -1,18 +1,90 @@
-use std::{fs, path::PathBuf, thread};
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Display, fs, path::PathBuf, rc::Rc, time::Duration,
+};
 
-use dbus::{DbusInput, DbusOutput};
+use clap::{Parser, Subcommand, ValueEnum};
 use gtk::{gdk, prelude::*};
-use gtk4 as gtk;
-use gtk4_layer_shell::{Edge, Layer, LayerShell};
+use gtk4::{self as gtk, gio, glib};
 use log::error;
 use notification::{Notification, NotificationOutput};
-use relm4::prelude::*;
+use relm4::{ComponentBuilder, Sender, prelude::*};
 use serde::Deserialize;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-mod dbus;
+use crate::notification::{
+    ImageData, NotificationCloseReason, NotificationInit, NotificationInput,
+};
+
 mod notification;
 
+const INTERFACE_XML: &str = r#"
+<node>
+    <interface name="org.freedesktop.Notifications">
+        <method name="GetCapabilities">
+            <arg type="as" name="capabilities" direction="out"/>
+        </method>
+        <method name="Notify">
+            <arg type="s" name="app_name" direction="in"/> 
+            <arg type="u" name="replaces_id" direction="in"/>
+            <arg type="s" name="app_icon" direction="in"/>
+            <arg type="s" name="summary" direction="in"/>
+            <arg type="s" name="body" direction="in"/>
+            <arg type="as" name="actions" direction="in"/>
+            <arg type="a{sv}" name="hints" direction="in"/>
+            <arg type="i" name="expire_timeout" direction="in"/>
+            <arg type="u" name="id" direction="out"/>
+        </method>
+        <method name="CloseNotification">
+            <arg type="u" name="id" direction="in"/>
+        </method>
+        <method name="GetServerInformation">
+            <arg type="s" name="name" direction="out"/>
+            <arg type="s" name="vendor" direction="out"/>
+            <arg type="s" name="version" direction="out"/>
+            <arg type="s" name="spec_version" direction="out"/>
+        </method>
+
+        <signal name="NotificationClosed">
+            <arg type="u" name="id"/>
+            <arg type="u" name="reason"/>
+        </signal>
+        <signal name="ActionInvoked">
+            <arg type="u" name="id"/>
+            <arg type="s" name="action_key"/>
+        </signal>
+        <signal name="ActivationToken">
+            <arg type="u" name="id"/>
+            <arg type="s" name="activation_token"/>
+        </signal>
+    </interface>
+    <interface name="com.kirottu.Yand">
+        <method name="Reload"/>
+        <property type="s" name="NotificationLevel" access="readwrite"/>
+    </interface>
+</node>
+"#;
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+const NOTIFICATIONS_IFACE: &str = "org.freedesktop.Notifications";
+const CONTROL_PATH: &str = "/com/kirottu/Yand";
+const CONTROL_IFACE: &str = "com.kirottu.Yand";
+
+#[derive(Parser)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the notification daemon
+    Daemon,
+    /// Reload config and style files
+    Reload,
+    /// Manage notification level
+    Level {
+        /// Set the notification level to this value
+        level: Option<NotificationLevel>,
+    },
+}
 #[derive(Clone, Deserialize, Debug)]
 struct AppOverride {
     app_name: String,
@@ -28,7 +100,7 @@ enum ConfigLayer {
     Overlay,
 }
 
-impl From<ConfigLayer> for Layer {
+impl From<ConfigLayer> for gtk4_layer_shell::Layer {
     fn from(value: ConfigLayer) -> Self {
         match value {
             ConfigLayer::Background => Self::Background,
@@ -44,6 +116,7 @@ impl From<ConfigLayer> for Layer {
 pub struct Config {
     width: i32,
     spacing: i32,
+    margin: i32,
     output: Option<String>,
     timeout: u32,
     layer: ConfigLayer,
@@ -59,7 +132,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             width: 400,
-            spacing: 10,
+            spacing: 20,
+            margin: 10,
             output: None,
             timeout: 10,
             layer: ConfigLayer::Overlay,
@@ -85,219 +159,178 @@ impl Config {
     }
 }
 
-struct App {
-    config_path: PathBuf,
-    style_path: PathBuf,
-    config: Config,
-    /// Stored reference to global gdk::Display
-    display: gdk::Display,
-    /// Used for managing custom CSS
-    css_provider: gtk::CssProvider,
-    notifications: FactoryVecDeque<Notification>,
-    notification_level: dbus::NotificationLevel,
-    tx: UnboundedSender<dbus::DbusInput>,
+#[derive(Debug, glib::Variant)]
+struct NotifyArgs {
+    app_name: String,
+    replaces_id: u32,
+    app_icon: String,
+    summary: String,
+    body: String,
+    actions: Vec<String>,
+    hints: HashMap<String, glib::Variant>,
+    expire_timeout: i32,
 }
 
-struct AppInit {
-    rx: UnboundedReceiver<DbusOutput>,
-    tx: UnboundedSender<dbus::DbusInput>,
-}
+impl NotifyArgs {
+    fn into_notification_init(self, id: u32, offset: i32) -> NotificationInit {
+        let actions = self
+            .actions
+            .chunks_exact(2)
+            .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
+            .collect();
 
-#[relm4::component]
-impl Component for App {
-    type Init = AppInit;
-    type Input = NotificationOutput;
-    type Output = ();
-    type CommandOutput = DbusOutput;
-
-    view! {
-        gtk::Window {
-            init_layer_shell: (),
-            #[watch]
-            set_layer: model.config.layer.clone().into(),
-            set_anchor: (Edge::Right, true),
-            set_anchor: (Edge::Top, true),
-            set_namespace: Some("yand"),
-            #[watch]
-            set_monitor: {
-                let monitors = model.display.monitors();
-
-                if let Some(output) = &model.config.output {
-                    monitors.into_iter().find_map(|item| {
-                        let monitor = item.unwrap().downcast::<gdk::Monitor>().unwrap();
-
-                        if monitor.connector() == Some(output.clone().into()) {
-                            Some(monitor)
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            }.as_ref(),
-            #[watch]
-            set_default_size: (model.config.width, 1),
-
-            #[local_ref]
-            notification_box -> gtk::Box {
-                set_css_classes: &["notification-box"],
-                set_orientation: gtk::Orientation::Vertical,
-                #[watch]
-                set_spacing: model.config.spacing,
-                set_hexpand: true,
-            }
-
-        }
-    }
-
-    fn init(
-        init: AppInit,
-        root: Self::Root,
-        sender: ComponentSender<Self>,
-    ) -> ComponentParts<Self> {
-        let notifications = FactoryVecDeque::builder()
-            .launch(gtk::Box::default())
-            .forward(sender.input_sender(), |output| output);
-
-        let dirs = xdg::BaseDirectories::with_prefix("yand");
-
-        let config_path = dirs
-            .place_config_file("config.toml")
-            .expect("Failed to create config directory");
-        let style_path = dirs
-            .get_config_file("style.css")
-            .expect("Failed to get style path");
-
-        let mut model = Self {
-            display: gdk::Display::default().unwrap(),
-            css_provider: gtk::CssProvider::default(),
-            style_path,
-            config_path,
-            config: Config::default(),
-            notification_level: dbus::NotificationLevel::Normal,
-            notifications,
-            tx: init.tx,
+        let mut init = NotificationInit {
+            id,
+            app_name: self.app_name,
+            app_icon: self.app_icon,
+            summary: self.summary,
+            body: self.body,
+            actions,
+            offset,
+            expire_timeout: self.expire_timeout,
+            action_icons: None,
+            image_data: None,
+            urgency: None,
+            image_path: None,
+            resident: None,
         };
 
-        let notification_box = model.notifications.widget();
-        let widgets = view_output!();
-
-        model.reload();
-
-        let mut rx = init.rx;
-
-        // For some reason using a gtk::Grid inside the Notification causes a ton of GTK warnings
-        // in the log output. The UI works perfectly fine so this is used to suppress the warnings
-        // glib::log_set_writer_func(|level, fields| {
-        //     if level == glib::LogLevel::Error || level == glib::LogLevel::Critical {
-        //         glib::log_writer_default(level, fields);
-        //     }
-        //     glib::LogWriterOutput::Handled
-        // });
-
-        sender.command(async move |sender, _shutdown_receiver| {
-            while let Some(msg) = rx.recv().await {
-                sender.send(msg).unwrap();
-            }
-        });
-
-        ComponentParts { model, widgets }
-    }
-
-    fn update_with_view(
-        &mut self,
-        widgets: &mut Self::Widgets,
-        message: Self::Input,
-        sender: ComponentSender<Self>,
-        root: &Self::Root,
-    ) {
-        match message {
-            NotificationOutput::Close { index, reason } => {
-                if let Some(notification) = self.notifications.guard().remove(index.current_index())
-                {
-                    self.tx
-                        .send(DbusInput::NotificationClosed {
-                            id: notification.id,
-                            reason,
-                        })
-                        .unwrap()
+        for (key, value) in self.hints {
+            match key.as_str() {
+                "action-icons" => init.action_icons = FromVariant::from_variant(&value),
+                "image-data" => {
+                    let data: Option<(i32, i32, i32, bool, i32, i32, Vec<u8>)> =
+                        FromVariant::from_variant(&value);
+                    if let Some((
+                        width,
+                        height,
+                        rowstride,
+                        has_alpha,
+                        _bits_per_sample,
+                        _channels,
+                        data,
+                    )) = data
+                    {
+                        init.image_data = Some(ImageData {
+                            width,
+                            height,
+                            rowstride,
+                            has_alpha,
+                            data,
+                        });
+                    }
                 }
-            }
-            NotificationOutput::ActionInvoked { index, action } => {
-                if let Some(notification) = self.notifications.guard().remove(index.current_index())
-                {
-                    self.tx
-                        .send(DbusInput::ActionInvoked {
-                            id: notification.id,
-                            action,
-                        })
-                        .unwrap()
-                }
+                "image-path" => init.image_path = FromVariant::from_variant(&value),
+                "resident" => init.resident = FromVariant::from_variant(&value),
+                "urgency" => init.urgency = u8::from_variant(&value).map(Into::into),
+                _ => (),
             }
         }
 
-        self.update_window(root);
-        self.update_view(widgets, sender);
-    }
-
-    fn update_cmd_with_view(
-        &mut self,
-        widgets: &mut Self::Widgets,
-        message: Self::CommandOutput,
-        sender: ComponentSender<Self>,
-        root: &Self::Root,
-    ) {
-        match message {
-            DbusOutput::Notification(dbus_notification) => match self.notification_level {
-                dbus::NotificationLevel::Normal => {
-                    self.add_notification_popup(dbus_notification);
-                }
-                dbus::NotificationLevel::Dnd => {}
-            },
-            DbusOutput::CloseNotification(id) => {
-                let i =
-                    self.notifications
-                        .guard()
-                        .iter()
-                        .enumerate()
-                        .find_map(
-                            |(i, notification)| if notification.id == id { Some(i) } else { None },
-                        );
-
-                if let Some(i) = i {
-                    self.notifications.guard().remove(i);
-                }
-            }
-            DbusOutput::GetNotificationLevel(tx) => {
-                tx.send(self.notification_level).unwrap();
-            }
-            DbusOutput::SetNotificationLevel(level) => {
-                self.notification_level = level;
-            }
-            DbusOutput::Reload => {
-                self.reload();
-            }
-            DbusOutput::Quit => {
-                root.destroy();
-            }
-        }
-
-        self.update_window(root);
-        self.update_view(widgets, sender);
+        init
     }
 }
 
-impl App {
-    fn update_window(&self, root: &<App as Component>::Root) {
-        if !self.notifications.is_empty() && !root.is_visible() {
-            root.set_visible(true);
-        } else if self.notifications.is_empty() && root.is_visible() {
-            root.set_visible(false);
+#[derive(Debug, glib::Variant)]
+struct CloseNotificationArgs {
+    id: u32,
+}
+
+#[derive(Debug)]
+enum NotificationMethod {
+    GetCapabilities,
+    Notify(NotifyArgs),
+    CloseNotification(CloseNotificationArgs),
+    GetServerInformation,
+}
+
+impl DBusMethodCall for NotificationMethod {
+    fn parse_call(
+        _obj_path: &str,
+        _interface: Option<&str>,
+        method: &str,
+        params: glib::Variant,
+    ) -> Result<Self, glib::Error> {
+        match method {
+            "GetCapabilities" => Ok(Some(Self::GetCapabilities)),
+            "Notify" => Ok(params.get::<NotifyArgs>().map(Self::Notify)),
+            "CloseNotification" => Ok(params
+                .get::<CloseNotificationArgs>()
+                .map(Self::CloseNotification)),
+            "GetServerInformation" => Ok(Some(Self::GetServerInformation)),
+            _ => Err(glib::Error::new(
+                gio::DBusError::UnknownMethod,
+                "No such method",
+            )),
+        }
+        .and_then(|p| {
+            p.ok_or_else(|| glib::Error::new(gio::DBusError::InvalidArgs, "Invalid parameters"))
+        })
+    }
+}
+
+enum ControlMethod {
+    Reload,
+}
+
+impl DBusMethodCall for ControlMethod {
+    fn parse_call(
+        _obj_path: &str,
+        _interface: Option<&str>,
+        method: &str,
+        _params: glib::Variant,
+    ) -> Result<Self, glib::Error> {
+        match method {
+            "Reload" => Ok(Some(Self::Reload)),
+            _ => Err(glib::Error::new(
+                gio::DBusError::UnknownMethod,
+                "No such method",
+            )),
+        }
+        .and_then(|p| {
+            p.ok_or_else(|| glib::Error::new(gio::DBusError::InvalidArgs, "Invalid parameters"))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, glib::Variant, ValueEnum, Default)]
+pub enum NotificationLevel {
+    #[default]
+    Normal,
+    Dnd,
+}
+
+impl Display for NotificationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotificationLevel::Normal => f.write_str("normal"),
+            NotificationLevel::Dnd => f.write_str("dnd"),
         }
     }
+}
 
+// Daemon side state per every notification
+struct NotificationState {
+    id: u32,
+    sender: Sender<NotificationInput>,
+    window: gtk::Window,
+}
+
+struct DaemonState {
+    config: Config,
+    config_path: PathBuf,
+    style_path: PathBuf,
+    css_provider: gtk::CssProvider,
+
+    notification_level: NotificationLevel,
+    notifications: Vec<NotificationState>,
+    // The ID for the next notification that will be created
+    next_id: u32,
+}
+
+impl DaemonState {
     fn reload(&mut self) {
+        let display = gdk::Display::default().unwrap();
         self.config = if let Ok(str) = fs::read_to_string(&self.config_path) {
             toml::from_str::<Config>(&str).unwrap_or_else(|why| {
                 error!("Failed to parse config file: {}", why);
@@ -307,7 +340,7 @@ impl App {
             Config::default()
         };
 
-        gtk::style_context_remove_provider_for_display(&self.display, &self.css_provider);
+        gtk::style_context_remove_provider_for_display(&display, &self.css_provider);
 
         self.css_provider = gtk::CssProvider::new();
 
@@ -318,48 +351,354 @@ impl App {
                 .load_from_string(include_str!("../res/style.css"));
         }
         gtk::style_context_add_provider_for_display(
-            &self.display,
+            &display,
             &self.css_provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+
+        log::info!("Config reloaded");
+
+        self.recalculate_offsets();
     }
 
-    fn add_notification_popup(&mut self, dbus_notification: dbus::DbusNotification) {
-        // It is fine to run the replacement routine here as if replace_id is 0 no notification
-        // will match it anyways
-        let mut notifications = self.notifications.guard();
-
-        let index = notifications
-            .iter()
-            .enumerate()
-            .find_map(|(i, notification)| {
-                if notification.id == dbus_notification.replaces_id {
-                    Some(i)
-                } else {
-                    None
-                }
-            });
-        if let Some(index) = index {
-            notifications.remove(index);
-            notifications.insert(index, (dbus_notification, self.config.clone()));
-        } else {
-            notifications.push_back((dbus_notification, self.config.clone()));
+    // Before this is called, the notifications vector should be "clean"
+    fn recalculate_offsets(&self) -> i32 {
+        let mut offset = 0;
+        for state in &self.notifications {
+            state.sender.emit(NotificationInput::ChangeOffset(offset));
+            offset += self.config.spacing + state.window.height();
         }
+        offset
     }
 }
 
 fn main() {
+    let args = Args::parse();
+    let flags = if matches!(args.command, Command::Daemon) {
+        gio::ApplicationFlags::IS_SERVICE
+    } else {
+        Default::default()
+    };
+
     colog::init();
 
-    let app = RelmApp::new("com.kirottu.yand").visible_on_activate(false);
+    let app = gtk::Application::new(Some(NOTIFICATIONS_IFACE), flags);
+    app.register(Option::<&gio::Cancellable>::None).unwrap();
 
-    let (dbus_tx, app_rx) = mpsc::unbounded_channel();
-    let (app_tx, dbus_rx) = mpsc::unbounded_channel();
+    let dbus_conn = app.dbus_connection().unwrap();
 
-    thread::spawn(|| dbus::start(dbus_rx, dbus_tx));
+    let node_info = gio::DBusNodeInfo::for_xml(INTERFACE_XML).unwrap();
 
-    app.run::<App>(AppInit {
-        rx: app_rx,
-        tx: app_tx,
-    });
+    let control_iface = node_info.lookup_interface(CONTROL_IFACE).unwrap();
+
+    match args.command {
+        Command::Level { level } => {
+            let property_proxy = gio::DBusProxy::new_sync(
+                &dbus_conn,
+                gio::DBusProxyFlags::empty(),
+                Some(&control_iface),
+                Some(NOTIFICATIONS_IFACE),
+                CONTROL_PATH,
+                "org.freedesktop.DBus.Properties",
+                Option::<&gio::Cancellable>::None,
+            )
+            .unwrap();
+            match level {
+                Some(level) => {
+                    property_proxy
+                        .call_sync(
+                            "Set",
+                            Some(&(level,).to_variant()),
+                            gio::DBusCallFlags::NONE,
+                            100,
+                            Option::<&gio::Cancellable>::None,
+                        )
+                        .unwrap();
+                }
+                None => {
+                    let level: (NotificationLevel,) = FromVariant::from_variant(
+                        &property_proxy
+                            .call_sync(
+                                "Get",
+                                None,
+                                gio::DBusCallFlags::NONE,
+                                100,
+                                Option::<&gio::Cancellable>::None,
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    println!("{}", level.0);
+                }
+            }
+            app.run_with_args(&Vec::<String>::new());
+        }
+        Command::Reload => {
+            let control_proxy = gio::DBusProxy::new_sync(
+                &dbus_conn,
+                gio::DBusProxyFlags::empty(),
+                Some(&control_iface),
+                Some(NOTIFICATIONS_IFACE),
+                CONTROL_PATH,
+                CONTROL_IFACE,
+                Option::<&gio::Cancellable>::None,
+            )
+            .unwrap();
+            control_proxy
+                .call_sync(
+                    "Reload",
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    100,
+                    Option::<&gio::Cancellable>::None,
+                )
+                .unwrap();
+            app.run_with_args(&Vec::<String>::new());
+        }
+        Command::Daemon => {
+            let notification_iface = node_info.lookup_interface(NOTIFICATIONS_IFACE).unwrap();
+            let _hold_guard = app.hold();
+
+            let dirs = xdg::BaseDirectories::with_prefix("yand");
+
+            let config_path = dirs
+                .place_config_file("config.toml")
+                .expect("Failed to create config directory");
+            let style_path = dirs
+                .get_config_file("style.css")
+                .expect("Failed to get style path");
+
+            let state = Rc::new(RefCell::new(DaemonState {
+                config_path,
+                style_path,
+                css_provider: gtk::CssProvider::new(),
+                config: Config::default(),
+                notifications: Vec::new(),
+                next_id: 1,
+                notification_level: NotificationLevel::default(),
+            }));
+
+            state.borrow_mut().reload();
+
+            dbus_conn
+                .register_object(NOTIFICATIONS_PATH, &notification_iface)
+                .typed_method_call::<NotificationMethod>()
+                .invoke(glib::clone!(
+                    #[weak_allow_none]
+                    app,
+                    #[strong]
+                    state,
+                    move |conn, _sender, method, invocation| {
+                        let app = app.unwrap();
+                        notification_handler(app, state.clone(), conn, method, invocation);
+                    }
+                ))
+                .build()
+                .unwrap();
+
+            dbus_conn
+                .register_object("/com/kirottu/Yand", &control_iface)
+                .property(glib::clone!(
+                    #[strong]
+                    state,
+                    move |_conn, _sender, _path, _interface, name| {
+                        match name {
+                            "NotificationLevel" => state.borrow().notification_level.to_variant(),
+                            _ => ().to_variant(),
+                        }
+                    }
+                ))
+                .set_property(glib::clone!(
+                    #[strong]
+                    state,
+                    move |_conn, _sender, _path, _interface, name, val| {
+                        match name {
+                            "NotificationLevel" => {
+                                if let Some(level) = NotificationLevel::from_variant(&val) {
+                                    state.borrow_mut().notification_level = level;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
+                ))
+                .typed_method_call::<ControlMethod>()
+                .invoke(glib::clone!(
+                    #[strong]
+                    state,
+                    move |_conn, _sender, method, invocation| {
+                        match method {
+                            ControlMethod::Reload => {
+                                state.borrow_mut().reload();
+                                invocation.return_value(None);
+                            }
+                        }
+                    }
+                ))
+                .build()
+                .unwrap();
+
+            log::info!("Starting Yand");
+
+            app.run_with_args(&Vec::<String>::new());
+        }
+    }
+}
+
+fn notification_handler(
+    app: gtk::Application,
+    state: Rc<RefCell<DaemonState>>,
+    conn: gio::DBusConnection,
+    method: NotificationMethod,
+    invocation: gio::DBusMethodInvocation,
+) {
+    match method {
+        NotificationMethod::GetCapabilities => {
+            invocation.return_value(Some(
+                &(vec![
+                    "action-icons",
+                    "actions",
+                    "body",
+                    "body-markup",
+                    "icon-static",
+                ],)
+                    .to_variant(),
+            ));
+        }
+        NotificationMethod::Notify(args) => {
+            let mut _state = state.borrow_mut();
+            let id = if args.replaces_id == 0 {
+                let id = _state.next_id;
+                _state.next_id += 1;
+                id
+            } else {
+                args.replaces_id
+            };
+            log::info!("Notification {id} received: {}", args.summary);
+
+            match _state.notification_level {
+                NotificationLevel::Normal => {
+                    let offset = _state.recalculate_offsets();
+
+                    let init = args.into_notification_init(id, offset);
+
+                    let builder = ComponentBuilder::<Notification>::default();
+                    let connector = builder.launch((init, _state.config.clone()));
+
+                    let mut controller = connector.connect_receiver(glib::clone!(
+                        #[strong]
+                        state,
+                        #[strong]
+                        conn,
+                        move |sender, message| match message {
+                            NotificationOutput::Closed { id, reason } => {
+                                log::info!("Notification {id} closed: {reason:?}");
+                                let mut state = state.borrow_mut();
+
+                                state
+                                    .notifications
+                                    .retain(|notification| notification.id != id);
+
+                                state.recalculate_offsets();
+                                conn.emit_signal(
+                                    None,
+                                    NOTIFICATIONS_PATH,
+                                    NOTIFICATIONS_IFACE,
+                                    "NotificationClosed",
+                                    Some(&(id, u32::from(reason)).to_variant()),
+                                )
+                                .unwrap();
+
+                                // These need to be periodically cleared, and when all notifications have been closed it is
+                                // an excellent time to do so
+                                if state.notifications.is_empty() {
+                                    relm4::runtime_util::shutdown_all();
+                                }
+                            }
+                            NotificationOutput::ActionInvoked { id, action } => {
+                                log::info!("Notification {id} action invoked: {action}");
+                                sender
+                                    .send(notification::NotificationInput::Close(
+                                        NotificationCloseReason::DismissedByUser,
+                                    ))
+                                    .unwrap();
+
+                                let display = gdk::Display::default().unwrap();
+                                let ctx = display.app_launch_context();
+                                if let Some(token) =
+                                    ctx.startup_notify_id(Option::<&gio::AppInfo>::None, &[])
+                                {
+                                    log::info!("{token}");
+                                    conn.emit_signal(
+                                        None,
+                                        NOTIFICATIONS_PATH,
+                                        NOTIFICATIONS_IFACE,
+                                        "ActivationToken",
+                                        Some(&(id, token.to_string()).to_variant()),
+                                    )
+                                    .unwrap();
+                                }
+
+                                conn.emit_signal(
+                                    None,
+                                    NOTIFICATIONS_PATH,
+                                    NOTIFICATIONS_IFACE,
+                                    "ActionInvoked",
+                                    Some(&(id, action).to_variant()),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    ));
+
+                    let window = controller.widget();
+                    app.add_window(window);
+                    window.set_visible(true);
+
+                    _state.notifications.push(NotificationState {
+                        id,
+                        sender: controller.sender().clone(),
+                        window: window.clone(),
+                    });
+
+                    controller.detach_runtime();
+                }
+                NotificationLevel::Dnd => {
+                    // Send an event regarding the closure after a little bit
+                    glib::timeout_add_once(Duration::from_millis(100), move || {
+                        conn.emit_signal(
+                            None,
+                            NOTIFICATIONS_PATH,
+                            NOTIFICATIONS_IFACE,
+                            "NotificationClosed",
+                            Some(&(id, u32::from(NotificationCloseReason::Undefined)).to_variant()),
+                        )
+                        .unwrap();
+                    });
+                }
+            }
+            invocation.return_value(Some(&(id,).to_variant()));
+        }
+        NotificationMethod::CloseNotification(close_notification_args) => {
+            if let Some(notification) = state
+                .borrow()
+                .notifications
+                .iter()
+                .find(|n| n.id == close_notification_args.id)
+            {
+                notification.sender.emit(NotificationInput::Close(
+                    NotificationCloseReason::DismissedByApp,
+                ));
+            }
+            invocation.return_value(None);
+        }
+        NotificationMethod::GetServerInformation => {
+            invocation.return_value(Some(
+                &("Yand", "Kirottu", env!("CARGO_PKG_VERSION"), "1.3").to_variant(),
+            ));
+        }
+    }
 }

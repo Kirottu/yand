@@ -77,18 +77,18 @@ in
       Service = {
         Type = "dbus";
         BusName = "org.freedesktop.Notifications";
-        ExecStart = "${getExe cfg.package}";
+        ExecStart = "${getExe cfg.package} daemon";
         Restart = "always";
       };
       Install.WantedBy = [ config.wayland.systemd.target ];
     };
 
     xdg.configFile."yand/config.toml" = mkIf (cfg.settings != { }) {
-      onChange = "${cfg.package}/bin/yandctl reload";
+      onChange = "${getExe cfg.package} reload";
       source = tomlFormat.generate "yand-config" cfg.settings;
     };
     xdg.configFile."yand/style.css" = mkIf (cfg.style != null) {
-      onChange = "${cfg.package}/bin/yandctl reload";
+      onChange = "${getExe cfg.package} reload";
       source =
         if builtins.isPath cfg.style || isStorePath cfg.style then
           cfg.style
