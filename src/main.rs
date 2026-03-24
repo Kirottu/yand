@@ -58,6 +58,9 @@ const INTERFACE_XML: &str = r#"
     </interface>
     <interface name="com.kirottu.Yand">
         <method name="Reload"/>
+        <method name="SetOffset">
+            <arg type="i" name="offset" direction="in"/>
+        </method>
         <property type="s" name="NotificationLevel" access="readwrite"/>
     </interface>
 </node>
@@ -84,6 +87,9 @@ enum Command {
         /// Set the notification level to this value
         level: Option<NotificationLevel>,
     },
+    /// Set a vertical offset for notifications temporarily.
+    /// Useful for making sure notifications align with possibly dynamic UI elements.
+    SetOffset { offset: i32 },
 }
 #[derive(Clone, Deserialize, Debug)]
 struct AppOverride {
@@ -269,8 +275,14 @@ impl DBusMethodCall for NotificationMethod {
     }
 }
 
+#[derive(Debug, glib::Variant)]
+struct SetOffsetArgs {
+    offset: i32,
+}
+
 enum ControlMethod {
     Reload,
+    SetOffset(SetOffsetArgs),
 }
 
 impl DBusMethodCall for ControlMethod {
@@ -278,10 +290,11 @@ impl DBusMethodCall for ControlMethod {
         _obj_path: &str,
         _interface: Option<&str>,
         method: &str,
-        _params: glib::Variant,
+        params: glib::Variant,
     ) -> Result<Self, glib::Error> {
         match method {
             "Reload" => Ok(Some(Self::Reload)),
+            "SetOffset" => Ok(params.get::<SetOffsetArgs>().map(Self::SetOffset)),
             _ => Err(glib::Error::new(
                 gio::DBusError::UnknownMethod,
                 "No such method",
@@ -326,6 +339,9 @@ struct DaemonState {
     notifications: Vec<NotificationState>,
     // The ID for the next notification that will be created
     next_id: u32,
+    // A temporary extra offset managed with IPC. Useful for making sure notifications
+    // align with dynamically placed panels
+    offset: i32,
 }
 
 impl DaemonState {
@@ -363,7 +379,7 @@ impl DaemonState {
 
     // Before this is called, the notifications vector should be "clean"
     fn recalculate_offsets(&self) -> i32 {
-        let mut offset = 0;
+        let mut offset = self.offset;
         for state in &self.notifications {
             state.sender.emit(NotificationInput::ChangeOffset(offset));
             offset += self.config.spacing + state.window.height();
@@ -391,7 +407,30 @@ fn main() {
 
     let control_iface = node_info.lookup_interface(CONTROL_IFACE).unwrap();
 
+    let control_proxy = gio::DBusProxy::new_sync(
+        &dbus_conn,
+        gio::DBusProxyFlags::empty(),
+        Some(&control_iface),
+        Some(NOTIFICATIONS_IFACE),
+        CONTROL_PATH,
+        CONTROL_IFACE,
+        Option::<&gio::Cancellable>::None,
+    )
+    .unwrap();
+
     match args.command {
+        Command::SetOffset { offset } => {
+            control_proxy
+                .call_sync(
+                    "SetOffset",
+                    Some(&(offset,).to_variant()),
+                    gio::DBusCallFlags::NONE,
+                    100,
+                    Option::<&gio::Cancellable>::None,
+                )
+                .unwrap();
+            app.run_with_args(&Vec::<String>::new());
+        }
         Command::Level { level } => {
             let property_proxy = gio::DBusProxy::new_sync(
                 &dbus_conn,
@@ -434,16 +473,6 @@ fn main() {
             app.run_with_args(&Vec::<String>::new());
         }
         Command::Reload => {
-            let control_proxy = gio::DBusProxy::new_sync(
-                &dbus_conn,
-                gio::DBusProxyFlags::empty(),
-                Some(&control_iface),
-                Some(NOTIFICATIONS_IFACE),
-                CONTROL_PATH,
-                CONTROL_IFACE,
-                Option::<&gio::Cancellable>::None,
-            )
-            .unwrap();
             control_proxy
                 .call_sync(
                     "Reload",
@@ -476,6 +505,7 @@ fn main() {
                 notifications: Vec::new(),
                 next_id: 1,
                 notification_level: NotificationLevel::default(),
+                offset: 0,
             }));
 
             state.borrow_mut().reload();
@@ -533,6 +563,11 @@ fn main() {
                         match method {
                             ControlMethod::Reload => {
                                 state.borrow_mut().reload();
+                                invocation.return_value(None);
+                            }
+                            ControlMethod::SetOffset(args) => {
+                                state.borrow_mut().offset = args.offset;
+                                state.borrow().recalculate_offsets();
                                 invocation.return_value(None);
                             }
                         }
