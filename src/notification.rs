@@ -85,13 +85,12 @@ pub struct NotificationInit {
 
     // Supported hints
     pub action_icons: Option<bool>,
-    pub image_data: Option<ImageData>, // TODO
+    pub image_data: Option<ImageData>,
     pub image_path: Option<String>,
     pub resident: Option<bool>,
     pub urgency: Option<Urgency>,
-
     // Extra data
-    pub offset: i32,
+    // pub offset: i32,
 }
 
 #[relm4::factory(pub)]
@@ -158,7 +157,10 @@ pub struct Notification {
     summary: String,
     body: String,
     urgency: Urgency,
+
+    // Watched variables
     offset: i32,
+    opacity: f64,
 
     config: Config,
 
@@ -184,6 +186,8 @@ impl Component for Notification {
             #[watch]
             set_margin: (gtk4_layer_shell::Edge::Top, model.offset),
             set_namespace: Some("yand"),
+            #[watch]
+            set_opacity: model.opacity,
             #[watch]
             set_monitor: {
                 let monitors = gdk::Display::default().unwrap().monitors();
@@ -373,7 +377,9 @@ impl Component for Notification {
         };
 
         let model = Self {
-            offset: config.margin_anchor + notification_init.offset,
+            offset: config.margin_anchor,
+            // Opacity is set to 0 initially to make sure the window isn't visible before the correct position has been configured
+            opacity: 0.0,
             config,
             icon,
             default_action,
@@ -404,8 +410,10 @@ impl Component for Notification {
         match message {
             NotificationInput::ChangeOffset(offset) => {
                 self.offset = self.config.margin_anchor + offset;
+                self.opacity = 1.0;
             }
             NotificationInput::Close(reason) => {
+                // For some reason, this fixes things.
                 root.set_visible(false);
                 root.close();
                 sender

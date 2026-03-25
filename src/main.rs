@@ -180,7 +180,7 @@ struct NotifyArgs {
 }
 
 impl NotifyArgs {
-    fn into_notification_init(self, id: u32, offset: i32) -> NotificationInit {
+    fn into_notification_init(self, id: u32) -> NotificationInit {
         let actions = self
             .actions
             .chunks_exact(2)
@@ -194,7 +194,6 @@ impl NotifyArgs {
             summary: self.summary,
             body: self.body,
             actions,
-            offset,
             expire_timeout: self.expire_timeout,
             action_icons: None,
             image_data: None,
@@ -380,13 +379,14 @@ impl DaemonState {
     }
 
     // Before this is called, the notifications vector should be "clean"
-    fn recalculate_offsets(&self) -> i32 {
+    fn recalculate_offsets(&self) {
+        log::info!("Recalculating offsets");
         let mut offset = self.offset;
         for state in &self.notifications {
+            log::info!("Offset: {offset}");
             state.sender.emit(NotificationInput::ChangeOffset(offset));
             offset += self.config.spacing + state.window.height();
         }
-        offset
     }
 }
 
@@ -618,9 +618,15 @@ fn notification_handler(
 
             match _state.notification_level {
                 NotificationLevel::Normal => {
-                    let offset = _state.recalculate_offsets();
+                    let init = args.into_notification_init(id);
 
-                    let init = args.into_notification_init(id, offset);
+                    glib::idle_add_local_once(glib::clone!(
+                        #[strong]
+                        state,
+                        move || {
+                            state.borrow().recalculate_offsets();
+                        }
+                    ));
 
                     let builder = ComponentBuilder::<Notification>::default();
                     let connector = builder.launch((init, _state.config.clone()));
@@ -633,13 +639,19 @@ fn notification_handler(
                         move |sender, message| match message {
                             NotificationOutput::Closed { id, reason } => {
                                 log::info!("Notification {id} closed: {reason:?}");
-                                let mut state = state.borrow_mut();
+                                let mut _state = state.borrow_mut();
 
-                                state
+                                _state
                                     .notifications
                                     .retain(|notification| notification.id != id);
 
-                                state.recalculate_offsets();
+                                glib::idle_add_local_once(glib::clone!(
+                                    #[strong]
+                                    state,
+                                    move || {
+                                        state.borrow().recalculate_offsets();
+                                    }
+                                ));
                                 conn.emit_signal(
                                     None,
                                     NOTIFICATIONS_PATH,
@@ -651,7 +663,7 @@ fn notification_handler(
 
                                 // These need to be periodically cleared, and when all notifications have been closed it is
                                 // an excellent time to do so
-                                if state.notifications.is_empty() {
+                                if _state.notifications.is_empty() {
                                     relm4::runtime_util::shutdown_all();
                                 }
                             }
