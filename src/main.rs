@@ -122,7 +122,8 @@ impl From<ConfigLayer> for gtk4_layer_shell::Layer {
 pub struct Config {
     width: i32,
     spacing: i32,
-    margin: i32,
+    margin_anchor: i32,
+    margin_side: i32,
     output: Option<String>,
     timeout: u32,
     layer: ConfigLayer,
@@ -139,7 +140,8 @@ impl Default for Config {
         Self {
             width: 400,
             spacing: 20,
-            margin: 10,
+            margin_side: 10,
+            margin_anchor: 10,
             output: None,
             timeout: 10,
             layer: ConfigLayer::Overlay,

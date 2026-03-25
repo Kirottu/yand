@@ -180,7 +180,7 @@ impl Component for Notification {
             set_layer: model.config.layer.clone().into(),
             set_anchor: (gtk4_layer_shell::Edge::Right, true),
             set_anchor: (gtk4_layer_shell::Edge::Top, true),
-            set_margin: (gtk4_layer_shell::Edge::Right, model.config.margin),
+            set_margin: (gtk4_layer_shell::Edge::Right, model.config.margin_side),
             #[watch]
             set_margin: (gtk4_layer_shell::Edge::Top, model.offset),
             set_namespace: Some("yand"),
@@ -355,15 +355,25 @@ impl Component for Notification {
             );
             NotificationIcon::Data(tex.into())
         } else if let Some(path) = notification_init.image_path {
-            NotificationIcon::Path(path)
+            if let Ok((path, _)) = glib::filename_from_uri(&path) {
+                NotificationIcon::Path(path.to_string_lossy().to_string())
+            } else {
+                NotificationIcon::Path(path)
+            }
         } else if !notification_init.app_icon.is_empty() {
-            NotificationIcon::Name(notification_init.app_icon)
+            // The spec allows for URIs in the app_icon field, but GTK is not a fan of them. So we must commit this
+            // atrocity
+            if let Ok((path, _)) = glib::filename_from_uri(&notification_init.app_icon) {
+                NotificationIcon::Path(path.to_string_lossy().to_string())
+            } else {
+                NotificationIcon::Name(notification_init.app_icon)
+            }
         } else {
             NotificationIcon::None
         };
 
         let model = Self {
-            offset: config.margin + notification_init.offset,
+            offset: config.margin_anchor + notification_init.offset,
             config,
             icon,
             default_action,
@@ -393,7 +403,7 @@ impl Component for Notification {
     fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match message {
             NotificationInput::ChangeOffset(offset) => {
-                self.offset = self.config.margin + offset;
+                self.offset = self.config.margin_anchor + offset;
             }
             NotificationInput::Close(reason) => {
                 root.set_visible(false);

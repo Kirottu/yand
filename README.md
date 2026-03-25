@@ -57,6 +57,11 @@ width = 400
 max_lines = 5
 # The size of the icon if provided by the application
 icon_size = 64
+# Margin to the anchoring edge, for now just the top of the screen
+margin_anchor = 10
+# Margin to the side edge
+margin_side = 10
+
 
 [[app_override]]
 # Name of the application as provided by the application
