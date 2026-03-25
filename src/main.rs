@@ -380,10 +380,8 @@ impl DaemonState {
 
     // Before this is called, the notifications vector should be "clean"
     fn recalculate_offsets(&self) {
-        log::info!("Recalculating offsets");
         let mut offset = self.offset;
         for state in &self.notifications {
-            log::info!("Offset: {offset}");
             state.sender.emit(NotificationInput::ChangeOffset(offset));
             offset += self.config.spacing + state.window.height();
         }
