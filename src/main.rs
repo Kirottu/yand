@@ -673,21 +673,22 @@ fn notification_handler(
                                     ))
                                     .unwrap();
 
-                                let display = gdk::Display::default().unwrap();
-                                let ctx = display.app_launch_context();
-                                if let Some(token) =
-                                    ctx.startup_notify_id(Option::<&gio::AppInfo>::None, &[])
-                                {
-                                    log::info!("{token}");
-                                    conn.emit_signal(
-                                        None,
-                                        NOTIFICATIONS_PATH,
-                                        NOTIFICATIONS_IFACE,
-                                        "ActivationToken",
-                                        Some(&(id, token.to_string()).to_variant()),
-                                    )
-                                    .unwrap();
-                                }
+                                // Does not work right now, and does some weird stuff
+                                // let display = gdk::Display::default().unwrap();
+                                // let ctx = display.app_launch_context();
+                                // if let Some(token) =
+                                //     ctx.startup_notify_id(Option::<&gio::AppInfo>::None, &[])
+                                // {
+                                //     log::info!("{token}");
+                                //     conn.emit_signal(
+                                //         None,
+                                //         NOTIFICATIONS_PATH,
+                                //         NOTIFICATIONS_IFACE,
+                                //         "ActivationToken",
+                                //         Some(&(id, token.to_string()).to_variant()),
+                                //     )
+                                //     .unwrap();
+                                // }
 
                                 conn.emit_signal(
                                     None,
