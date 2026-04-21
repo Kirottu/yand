@@ -135,6 +135,13 @@ pub struct Config {
     app_overrides: Vec<AppOverride>,
 }
 
+/// The overridden fields
+#[derive(Default)]
+pub struct ConfigOverrides {
+    timeout: bool,
+    max_lines: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -154,16 +161,25 @@ impl Default for Config {
 
 impl Config {
     /// Return the same config entry with overridden options
-    fn overridden(mut self, app_override: AppOverride) -> (Self, bool) {
+    fn overridden(mut self, app_name: &str) -> (Self, ConfigOverrides) {
+        let Some(app_override) = self
+            .app_overrides
+            .iter()
+            .find(|app_override| app_override.app_name == app_name)
+        else {
+            return (self, ConfigOverrides::default());
+        };
+        let mut overrides = ConfigOverrides::default();
+
         if let Some(val) = app_override.max_lines {
             self.max_lines = val;
+            overrides.max_lines = true;
         }
-        let mut timeout_overridden = false;
         if let Some(val) = app_override.timeout {
             self.timeout = val;
-            timeout_overridden = true;
+            overrides.timeout = true;
         }
-        (self, timeout_overridden)
+        (self, overrides)
     }
 }
 
@@ -605,12 +621,18 @@ fn notification_handler(
         }
         NotificationMethod::Notify(args) => {
             let mut _state = state.borrow_mut();
-            let id = if args.replaces_id == 0 {
+            let (id, notification_state) = if args.replaces_id == 0 {
                 let id = _state.next_id;
                 _state.next_id += 1;
-                id
+                (id, None)
             } else {
-                args.replaces_id
+                (
+                    args.replaces_id,
+                    _state
+                        .notifications
+                        .iter()
+                        .find(|notification_state| notification_state.id == args.replaces_id),
+                )
             };
             log::info!("Notification {id} received: {}", args.summary);
 
@@ -626,93 +648,102 @@ fn notification_handler(
                         }
                     ));
 
-                    let builder = ComponentBuilder::<Notification>::default();
-                    let connector = builder.launch((init, _state.config.clone()));
+                    if let Some(notification_state) = notification_state {
+                        notification_state
+                            .sender
+                            .emit(NotificationInput::Replace(Box::new((
+                                init,
+                                _state.config.clone(),
+                            ))));
+                    } else {
+                        let builder = ComponentBuilder::<Notification>::default();
+                        let connector = builder.launch((init, _state.config.clone()));
 
-                    let mut controller = connector.connect_receiver(glib::clone!(
-                        #[strong]
-                        state,
-                        #[strong]
-                        conn,
-                        move |sender, message| match message {
-                            NotificationOutput::Closed { id, reason } => {
-                                log::info!("Notification {id} closed: {reason:?}");
-                                let mut _state = state.borrow_mut();
+                        let mut controller = connector.connect_receiver(glib::clone!(
+                            #[strong]
+                            state,
+                            #[strong]
+                            conn,
+                            move |sender, message| match message {
+                                NotificationOutput::Closed { id, reason } => {
+                                    log::info!("Notification {id} closed: {reason:?}");
+                                    let mut _state = state.borrow_mut();
 
-                                _state
-                                    .notifications
-                                    .retain(|notification| notification.id != id);
+                                    _state
+                                        .notifications
+                                        .retain(|notification| notification.id != id);
 
-                                glib::idle_add_local_once(glib::clone!(
-                                    #[strong]
-                                    state,
-                                    move || {
-                                        state.borrow().recalculate_offsets();
-                                    }
-                                ));
-                                conn.emit_signal(
-                                    None,
-                                    NOTIFICATIONS_PATH,
-                                    NOTIFICATIONS_IFACE,
-                                    "NotificationClosed",
-                                    Some(&(id, u32::from(reason)).to_variant()),
-                                )
-                                .unwrap();
-
-                                // These need to be periodically cleared, and when all notifications have been closed it is
-                                // an excellent time to do so
-                                if _state.notifications.is_empty() {
-                                    relm4::runtime_util::shutdown_all();
-                                }
-                            }
-                            NotificationOutput::ActionInvoked { id, action } => {
-                                log::info!("Notification {id} action invoked: {action}");
-                                sender
-                                    .send(notification::NotificationInput::Close(
-                                        NotificationCloseReason::DismissedByUser,
-                                    ))
+                                    glib::idle_add_local_once(glib::clone!(
+                                        #[strong]
+                                        state,
+                                        move || {
+                                            state.borrow().recalculate_offsets();
+                                        }
+                                    ));
+                                    conn.emit_signal(
+                                        None,
+                                        NOTIFICATIONS_PATH,
+                                        NOTIFICATIONS_IFACE,
+                                        "NotificationClosed",
+                                        Some(&(id, u32::from(reason)).to_variant()),
+                                    )
                                     .unwrap();
 
-                                // Does not work right now, and does some weird stuff
-                                // let display = gdk::Display::default().unwrap();
-                                // let ctx = display.app_launch_context();
-                                // if let Some(token) =
-                                //     ctx.startup_notify_id(Option::<&gio::AppInfo>::None, &[])
-                                // {
-                                //     log::info!("{token}");
-                                //     conn.emit_signal(
-                                //         None,
-                                //         NOTIFICATIONS_PATH,
-                                //         NOTIFICATIONS_IFACE,
-                                //         "ActivationToken",
-                                //         Some(&(id, token.to_string()).to_variant()),
-                                //     )
-                                //     .unwrap();
-                                // }
+                                    // These need to be periodically cleared, and when all notifications have been closed it is
+                                    // an excellent time to do so
+                                    if _state.notifications.is_empty() {
+                                        relm4::runtime_util::shutdown_all();
+                                    }
+                                }
+                                NotificationOutput::ActionInvoked { id, action } => {
+                                    log::info!("Notification {id} action invoked: {action}");
+                                    sender
+                                        .send(notification::NotificationInput::Close(
+                                            NotificationCloseReason::DismissedByUser,
+                                        ))
+                                        .unwrap();
 
-                                conn.emit_signal(
-                                    None,
-                                    NOTIFICATIONS_PATH,
-                                    NOTIFICATIONS_IFACE,
-                                    "ActionInvoked",
-                                    Some(&(id, action).to_variant()),
-                                )
-                                .unwrap();
+                                    // Does not work right now, and does some weird stuff
+                                    // let display = gdk::Display::default().unwrap();
+                                    // let ctx = display.app_launch_context();
+                                    // if let Some(token) =
+                                    //     ctx.startup_notify_id(Option::<&gio::AppInfo>::None, &[])
+                                    // {
+                                    //     log::info!("{token}");
+                                    //     conn.emit_signal(
+                                    //         None,
+                                    //         NOTIFICATIONS_PATH,
+                                    //         NOTIFICATIONS_IFACE,
+                                    //         "ActivationToken",
+                                    //         Some(&(id, token.to_string()).to_variant()),
+                                    //     )
+                                    //     .unwrap();
+                                    // }
+
+                                    conn.emit_signal(
+                                        None,
+                                        NOTIFICATIONS_PATH,
+                                        NOTIFICATIONS_IFACE,
+                                        "ActionInvoked",
+                                        Some(&(id, action).to_variant()),
+                                    )
+                                    .unwrap();
+                                }
                             }
-                        }
-                    ));
+                        ));
 
-                    let window = controller.widget();
-                    app.add_window(window);
-                    window.set_visible(true);
+                        let window = controller.widget();
+                        app.add_window(window);
+                        window.set_visible(true);
 
-                    _state.notifications.push(NotificationState {
-                        id,
-                        sender: controller.sender().clone(),
-                        window: window.clone(),
-                    });
+                        _state.notifications.push(NotificationState {
+                            id,
+                            sender: controller.sender().clone(),
+                            window: window.clone(),
+                        });
 
-                    controller.detach_runtime();
+                        controller.detach_runtime();
+                    }
                 }
                 NotificationLevel::Dnd => {
                     // Send an event regarding the closure after a little bit

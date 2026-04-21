@@ -6,7 +6,7 @@ use gtk4_layer_shell::LayerShell;
 use log::info;
 use relm4::prelude::*;
 
-use crate::Config;
+use crate::{Config, ConfigOverrides};
 
 const DEFAULT_ACTION: &str = "default";
 
@@ -25,7 +25,7 @@ pub struct ImageData {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum Urgency {
     Low,
     #[default]
@@ -93,6 +93,71 @@ pub struct NotificationInit {
     // pub offset: i32,
 }
 
+impl NotificationInit {
+    fn icon(&self) -> NotificationIcon {
+        if let Some(data) = &self.image_data {
+            let format = if data.has_alpha {
+                gdk::MemoryFormat::R8g8b8a8
+            } else {
+                gdk::MemoryFormat::R8g8b8
+            };
+            let tex = gdk::MemoryTexture::new(
+                data.width,
+                data.height,
+                format,
+                &glib::Bytes::from_owned(data.data.clone()),
+                data.rowstride as usize,
+            );
+            NotificationIcon::Data(tex.into())
+        } else if let Some(path) = &self.image_path {
+            if let Ok((path, _)) = glib::filename_from_uri(path) {
+                NotificationIcon::Path(path.to_string_lossy().to_string())
+            } else {
+                NotificationIcon::Path(path.clone())
+            }
+        } else if !self.app_icon.is_empty() {
+            // The spec allows for URIs in the app_icon field, but GTK is not a fan of them. So we must commit this
+            // atrocity
+            if let Ok((path, _)) = glib::filename_from_uri(&self.app_icon) {
+                NotificationIcon::Path(path.to_string_lossy().to_string())
+            } else {
+                NotificationIcon::Name(self.app_icon.clone())
+            }
+        } else {
+            NotificationIcon::None
+        }
+    }
+
+    fn default_action(&mut self) -> Option<String> {
+        let default_action_index = self
+            .actions
+            .iter()
+            .enumerate()
+            .find_map(|(i, (key, _))| if key == DEFAULT_ACTION { Some(i) } else { None });
+
+        default_action_index.map(|i| self.actions.remove(i).1)
+    }
+
+    /// Determine the timeout that should be used.
+    ///
+    /// Must be called after `Self::default_action` to make sure the action Vec is representative of what
+    /// is shown to users
+    fn timeout(&self, config: &Config, overrides: &ConfigOverrides) -> Option<u32> {
+        // If notification has 2 or more actions alongside a default
+        // disable timeout
+        //
+        // Odds are the notification wants some user input (looking at you blueman)
+        if self.actions.len() >= 2 {
+            None
+        } else if self.expire_timeout == -1 || overrides.timeout {
+            Some(config.timeout)
+        } else {
+            Some(self.expire_timeout as u32)
+        }
+        .and_then(|timeout| if timeout == 0 { None } else { Some(timeout) })
+    }
+}
+
 #[relm4::factory(pub)]
 impl FactoryComponent for ActionButton {
     type Init = (String, String);
@@ -147,12 +212,12 @@ pub enum NotificationOutput {
 pub enum NotificationInput {
     ChangeOffset(i32),
     Close(NotificationCloseReason),
+    Replace(Box<<Notification as Component>::Init>),
 }
 
 #[derive(Debug)]
 pub struct Notification {
     pub id: u32,
-    icon: NotificationIcon,
     app_name: String,
     summary: String,
     body: String,
@@ -164,8 +229,11 @@ pub struct Notification {
 
     config: Config,
 
+    icon_widget: gtk::Image,
     actions_factory: FactoryVecDeque<ActionButton>,
     default_action: Option<String>,
+    /// The ID to the glib timeout for possible cancellation during a replace event
+    timeout_source_id: Option<glib::SourceId>,
 }
 
 #[allow(unused_assignments)]
@@ -211,6 +279,7 @@ impl Component for Notification {
 
             #[name = "notification"]
             gtk::Box {
+                #[watch]
                 set_css_classes: &["notification", &model.urgency.to_string(), &model.app_name],
                 set_orientation: gtk::Orientation::Vertical,
                 set_hexpand: true,
@@ -235,6 +304,7 @@ impl Component for Notification {
                 },
 
                 gtk::Label {
+                    #[watch]
                     set_label: &model.summary,
                     set_css_classes: &["summary"],
                     set_justify: gtk::Justification::Left,
@@ -252,14 +322,16 @@ impl Component for Notification {
 
                     // For some reason the Image becomes larger if it is not inside a Stack
                     attach[0, 0, 1, 1] = &gtk::Stack {
-                        #[name = "icon"]
-                        gtk::Image {
+                        #[local_ref]
+                        icon_widget -> gtk::Image {
+                            #[watch]
                             set_pixel_size: model.config.icon_size,
                             set_css_classes: &["icon"],
                         },
                     },
 
                     attach[1, 0, 1, 1] = &gtk::Label {
+                        #[watch]
                         set_label: &model.body,
                         set_css_classes: &["body"],
                         set_halign: gtk::Align::Start,
@@ -286,35 +358,15 @@ impl Component for Notification {
     }
 
     fn init(
-        (mut notification_init, mut config): Self::Init,
+        (mut notification_init, config): Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let mut timeout_overridden = false;
-        if let Some(app_override) = config
-            .app_overrides
-            .iter()
-            .find(|app_override| app_override.app_name == notification_init.app_name)
-        {
-            (config, timeout_overridden) = config.clone().overridden(app_override.clone());
-        }
-
-        let mut timeout = if notification_init.expire_timeout == -1 || timeout_overridden {
-            config.timeout
-        } else {
-            notification_init.expire_timeout as u32
-        };
-
-        let default_action_index = notification_init
-            .actions
-            .iter()
-            .enumerate()
-            .find_map(|(i, (key, _))| if key == DEFAULT_ACTION { Some(i) } else { None });
-
-        let default_action = default_action_index.map(|i| notification_init.actions.remove(i).1);
+        let (config, overrides) = config.clone().overridden(&notification_init.app_name);
 
         let id = notification_init.id;
 
+        // If a factory already exists for the purposes of a notification replacement, use it
         let mut actions_factory: FactoryVecDeque<ActionButton> = FactoryVecDeque::builder()
             .launch(gtk::Box::default())
             .forward(
@@ -324,84 +376,41 @@ impl Component for Notification {
                 }),
             );
 
-        // If notification has 2 or more actions alongside a default
-        // disable timeout
-        //
-        // Odds are the notification wants some user input (looking at you blueman)
-        if notification_init.actions.len() >= 2 {
-            timeout = 0;
-        }
+        let default_action = notification_init.default_action();
 
-        for (action, display) in notification_init.actions {
+        let icon = notification_init.icon();
+
+        for (action, display) in notification_init.actions.clone() {
             info!("Action added for notification: {}, {}", action, display);
             actions_factory.guard().push_back((action, display));
         }
 
-        if timeout > 0 {
-            sender.oneshot_command(async move {
-                portable_async_sleep::async_sleep(Duration::from_secs(timeout as u64)).await;
-                NotificationInput::Close(NotificationCloseReason::Expired)
-            });
-        }
+        let icon_widget = gtk::Image::new();
 
-        let icon = if let Some(data) = notification_init.image_data {
-            let format = if data.has_alpha {
-                gdk::MemoryFormat::R8g8b8a8
-            } else {
-                gdk::MemoryFormat::R8g8b8
-            };
-            let tex = gdk::MemoryTexture::new(
-                data.width,
-                data.height,
-                format,
-                &glib::Bytes::from_owned(data.data),
-                data.rowstride as usize,
-            );
-            NotificationIcon::Data(tex.into())
-        } else if let Some(path) = notification_init.image_path {
-            if let Ok((path, _)) = glib::filename_from_uri(&path) {
-                NotificationIcon::Path(path.to_string_lossy().to_string())
-            } else {
-                NotificationIcon::Path(path)
-            }
-        } else if !notification_init.app_icon.is_empty() {
-            // The spec allows for URIs in the app_icon field, but GTK is not a fan of them. So we must commit this
-            // atrocity
-            if let Ok((path, _)) = glib::filename_from_uri(&notification_init.app_icon) {
-                NotificationIcon::Path(path.to_string_lossy().to_string())
-            } else {
-                NotificationIcon::Name(notification_init.app_icon)
-            }
-        } else {
-            NotificationIcon::None
-        };
-
-        let model = Self {
+        let mut model = Self {
             offset: config.margin_anchor,
             // Opacity is set to 0 initially to make sure the window isn't visible before the correct position has been configured
             opacity: 0.0,
             config,
-            icon,
+            icon_widget: icon_widget.clone(),
             default_action,
             actions_factory,
             id: notification_init.id,
-            app_name: notification_init.app_name,
-            summary: notification_init.summary,
+            app_name: notification_init.app_name.clone(),
+            summary: notification_init.summary.clone(),
             // Remove all newlines to make sure GTK can properly truncate the label
             // TODO: Configurable, figure out a better way to do this
             body: notification_init.body.replace('\n', " "),
             urgency: notification_init.urgency.unwrap_or_default(),
+            timeout_source_id: None,
         };
+
+        model.set_timeout(&notification_init, &overrides, sender.clone());
+        model.set_icon(icon);
+
         let action_buttons = model.actions_factory.widget();
 
         let widgets = view_output!();
-
-        match &model.icon {
-            NotificationIcon::Path(path) => widgets.icon.set_from_file(Some(path)),
-            NotificationIcon::Name(name) => widgets.icon.set_icon_name(Some(name)),
-            NotificationIcon::Data(texture) => widgets.icon.set_paintable(Some(texture)),
-            NotificationIcon::None => widgets.icon.set_visible(false),
-        }
 
         ComponentParts { model, widgets }
     }
@@ -423,6 +432,25 @@ impl Component for Notification {
                     })
                     .unwrap();
             }
+            NotificationInput::Replace(init) => {
+                let (mut notification_init, config) = *init;
+                let icon = notification_init.icon();
+                let default_action = notification_init.default_action();
+                let (config, overrides) = config.clone().overridden(&notification_init.app_name);
+                self.set_timeout(&notification_init, &overrides, sender);
+
+                self.actions_factory.guard().clear();
+                for (action, display) in notification_init.actions {
+                    info!("Action added for notification: {}, {}", action, display);
+                    self.actions_factory.guard().push_back((action, display));
+                }
+
+                self.set_icon(icon);
+                self.default_action = default_action;
+                self.config = config;
+                self.summary = notification_init.summary;
+                self.body = notification_init.body;
+            }
         }
     }
 
@@ -433,5 +461,45 @@ impl Component for Notification {
         _root: &<Self as Component>::Root,
     ) {
         sender.input(message);
+    }
+}
+
+impl Notification {
+    fn set_timeout(
+        &mut self,
+        notification_init: &NotificationInit,
+        overrides: &ConfigOverrides,
+        sender: ComponentSender<Self>,
+    ) {
+        // Cancel existing timeout
+        if let Some(source_id) = self.timeout_source_id.take() {
+            source_id.remove();
+        }
+        if let Some(timeout) = notification_init.timeout(&self.config, overrides) {
+            let source_id = glib::timeout_add_local_once(
+                Duration::from_secs(timeout as u64),
+                glib::clone!(
+                    #[strong]
+                    sender,
+                    move || {
+                        // This will error out if the notification was already closed for some other reason,
+                        // so we just discard the error
+                        let _ = sender
+                            .input_sender()
+                            .send(NotificationInput::Close(NotificationCloseReason::Expired));
+                    }
+                ),
+            );
+            self.timeout_source_id = Some(source_id);
+        }
+    }
+
+    fn set_icon(&self, icon: NotificationIcon) {
+        match &icon {
+            NotificationIcon::Path(path) => self.icon_widget.set_from_file(Some(path)),
+            NotificationIcon::Name(name) => self.icon_widget.set_icon_name(Some(name)),
+            NotificationIcon::Data(texture) => self.icon_widget.set_paintable(Some(texture)),
+            NotificationIcon::None => self.icon_widget.set_visible(false),
+        }
     }
 }
