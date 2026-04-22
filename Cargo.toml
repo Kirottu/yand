@@ -9,7 +9,6 @@ colog = "1.3.0"
 gtk4 = { version = "0.10.3", features = ["v4_16"] }
 gtk4-layer-shell = "0.7.0"
 log = "0.4.27"
-portable_async_sleep = "0.1.1"
 relm4 = { git = "https://github.com/anyrun-org/Relm4", branch = "service"}
 serde = { version = "1.0.219", features = ["derive"] }
 toml = "0.8.22"
